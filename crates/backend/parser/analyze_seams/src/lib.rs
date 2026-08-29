@@ -9,7 +9,7 @@ seam_core::seam!(
     pub fn parse_analyze_fixedparams<'a, 'mcx>(
         mcx: Mcx<'mcx>,
         parse_tree: &'a RawStmt<'mcx>,
-        source_text: &'a str,
+        source_text: &'mcx str,
         param_types: &'a [Oid],
         query_env: QueryEnvHandle,
     ) -> PgResult<Query<'mcx>>
@@ -21,7 +21,7 @@ seam_core::seam!(
     pub fn parse_analyze_sql_fn<'a, 'mcx>(
         mcx: Mcx<'mcx>,
         parse_tree: &'a RawStmt<'mcx>,
-        source_text: &'a str,
+        source_text: &'mcx str,
         fname: &'a str,
         argtypes: &'a [Oid],
         argnames: &'a [&'a str],
@@ -36,7 +36,7 @@ seam_core::seam!(
     pub fn transform_stmt_sql_fn<'a, 'mcx>(
         mcx: Mcx<'mcx>,
         stmt: types_nodes::Node<'mcx>,
-        source_text: &'a str,
+        source_text: &'mcx str,
         fname: &'a str,
         argtypes: &'a [Oid],
         argnames: &'a [&'a str],
@@ -49,7 +49,7 @@ seam_core::seam!(
     pub fn parse_analyze_varparams<'a, 'mcx>(
         mcx: Mcx<'mcx>,
         parse_tree: &'a RawStmt<'mcx>,
-        source_text: &'a str,
+        source_text: &'mcx str,
         param_types: &'a [Oid],
         query_env: QueryEnvHandle,
     ) -> PgResult<(Query<'mcx>, mcx::PgVec<'mcx, Oid>)>
@@ -61,7 +61,7 @@ seam_core::seam!(
     pub fn parse_analyze_plpgsql<'a, 'mcx>(
         mcx: Mcx<'mcx>,
         parse_tree: &'a RawStmt<'mcx>,
-        source_text: &'a str,
+        source_text: &'mcx str,
         hooks: &'a parser_small1::PlpgsqlHookState<'a>,
         query_env: QueryEnvHandle,
     ) -> PgResult<Query<'mcx>>

@@ -19,7 +19,7 @@ use types_rel::RELKIND_VIEW;
 pub fn DefineView<'mcx>(
     mcx: Mcx<'mcx>,
     stmt: &ViewStmt<'mcx>,
-    query_string: &str,
+    query_string: &'mcx str,
     stmt_location: i32,
     stmt_len: i32,
 ) -> PgResult<Oid> {

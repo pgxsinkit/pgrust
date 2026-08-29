@@ -829,7 +829,7 @@ fn slow_switch<'mcx>(
     mcx: Mcx<'mcx>,
     parsetree: Node<'_>,
     pstmt: &PlannedStmt<'_>,
-    source_text: &str,
+    source_text: &'mcx str,
     _context: ProcessUtilityContext,
     is_top_level: bool,
     params: ParamListHandle,

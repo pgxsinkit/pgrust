@@ -54,6 +54,11 @@ fn analyze_and_rewrite(
     argtypes: &[Oid],
     query_env: types_portal::QueryEnvHandle,
 ) -> PgResult<PgVec<'static, Query<'static>>> {
+    // The SPI plan's query arena outlives the caller's `src` (a borrowed
+    // command string, often a &'a slice of plpgsql source), so the text the
+    // analyzed tree borrows is copied into that arena once here — C pstrdups
+    // into the CachedPlanSource for the same reason.
+    let src = mcx::str_in(qmcx, src)?;
     let query = analyze_seams::parse_analyze_fixedparams::call(
         qmcx,
         raw,

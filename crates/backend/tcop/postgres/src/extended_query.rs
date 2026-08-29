@@ -90,7 +90,7 @@ fn aborted_xact_error() -> Box<types_error::PgError> {
 pub fn pg_analyze_and_rewrite_varparams<'mcx>(
     mcx: Mcx<'mcx>,
     parsetree: &RawStmt<'mcx>,
-    query_string: &str,
+    query_string: &'mcx str,
     param_types: &[Oid],
     query_env: QueryEnvHandle,
 ) -> PgResult<(PgVec<'mcx, Query<'mcx>>, PgVec<'mcx, Oid>)> {
@@ -268,6 +268,11 @@ fn fill_parse_plansource(
         let qmcx = plancache::SourceQueryMcx(psrc);
         let reparsed = plancache::CachedPlanRawParseTreeCopy(qmcx, psrc)?
             .expect("created with a raw tree");
+        // The one caller that must copy: the plansource outlives this Parse
+        // message, so the source text analysis borrows has to live in the
+        // plansource's query arena, not the message arena (C pstrdups into
+        // the CachedPlanSource for the same reason).
+        let query_string = mcx::str_in(qmcx, query_string)?;
 
         let (query_list, resolved) = pg_analyze_and_rewrite_varparams(
             qmcx,

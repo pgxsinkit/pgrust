@@ -1950,6 +1950,15 @@ pub fn box_into_inner<'mcx, T>(b: PgBox<'mcx, T>) -> T {
     allocator_api2::boxed::Box::into_inner(b)
 }
 
+/// C `MemoryContextStrdup` as a borrow: one arena copy of `s`, handed back as
+/// a `&'mcx str` the arena owns. For callers that outlive the string they were
+/// handed (a plancache query arena vs. the message arena).
+pub fn str_in<'mcx>(mcx: Mcx<'mcx>, s: &str) -> PgResult<&'mcx str> {
+    let bytes = slice_in(mcx, s.as_bytes())?.leak();
+    // SAFETY: byte-for-byte copy of a &str.
+    Ok(unsafe { core::str::from_utf8_unchecked(bytes) })
+}
+
 /// C palloc + memcpy, one-shot, len == capacity; Copy elements lower to one memcpy.
 #[inline]
 pub fn slice_in<'mcx, T: Clone>(mcx: Mcx<'mcx>, src: &[T]) -> PgResult<PgVec<'mcx, T>> {

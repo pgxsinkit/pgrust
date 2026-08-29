@@ -822,7 +822,7 @@ fn interpret_AS_clause<'mcx>(
     sql_body_in: Option<Node<'mcx>>,
     parameterTypes: &[Oid],
     inParameterNames: &[&str],
-    queryString: &str,
+    queryString: &'mcx str,
 ) -> PgResult<AsClause<'mcx>> {
     if sql_body_in.is_none() && as_clause.is_none() {
         return Err(err(
@@ -903,7 +903,7 @@ fn interpret_sql_body<'mcx>(
     sql_body_in: Node<'mcx>,
     parameterTypes: &[Oid],
     inParameterNames: &[&str],
-    queryString: &str,
+    queryString: &'mcx str,
 ) -> PgResult<AsClause<'mcx>> {
     for &t in parameterTypes {
         if coerce::IsPolymorphicType(t) {

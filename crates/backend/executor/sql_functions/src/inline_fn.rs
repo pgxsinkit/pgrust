@@ -208,10 +208,14 @@ fn inline_body<'a, 'mcx>(
         for n in row.argnames.iter() {
             name_refs.push(n.as_str());
         }
+        // prosrc outlives nothing here — `row` is a local — so the text the
+        // analyzed tree borrows is copied into the arena once (C's
+        // TextDatumGetCString into the current context).
+        let prosrc = mcx::str_in(mcx, row.prosrc.as_str())?;
         parsed_query = analyze_seams::parse_analyze_sql_fn::call(
             mcx,
             &raw_list[0],
-            row.prosrc.as_str(),
+            prosrc,
             row.proname.as_str(),
             &argtypes,
             &name_refs,

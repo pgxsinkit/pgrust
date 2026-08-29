@@ -73,10 +73,12 @@ fn inline_srf_body<'a, 'mcx>(
         for n in row.argnames.iter() {
             name_refs.push(n.as_str());
         }
+        // As inline_fn: one arena copy of prosrc for the analyzed tree.
+        let prosrc = mcx::str_in(mcx, row.prosrc.as_str())?;
         let query = analyze_seams::parse_analyze_sql_fn::call(
             mcx,
             &raw_list[0],
-            row.prosrc.as_str(),
+            prosrc,
             row.proname.as_str(),
             &argtypes,
             &name_refs,

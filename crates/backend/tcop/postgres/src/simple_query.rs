@@ -49,7 +49,7 @@ pub fn pg_parse_query<'mcx>(
 pub fn pg_analyze_and_rewrite_fixedparams<'a, 'mcx>(
     mcx: Mcx<'mcx>,
     parsetree: &'a RawStmt<'mcx>,
-    query_string: &'a str,
+    query_string: &'mcx str,
     param_types: &'a [types_core::Oid],
     query_env: QueryEnvHandle,
 ) -> PgResult<PgVec<'mcx, Query<'mcx>>> {

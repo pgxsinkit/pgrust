@@ -35,7 +35,7 @@ fn init_seams_once() {
 
 fn analyze<'mcx>(
     mcx: Mcx<'mcx>,
-    source: &str,
+    source: &'mcx str,
     raw_stmt: &RawStmt<'mcx>,
 ) -> types_nodes::parsenodes::Query<'mcx> {
     parse_analyze_fixedparams(mcx, raw_stmt, source, &[], Default::default()).unwrap()

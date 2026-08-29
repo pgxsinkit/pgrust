@@ -58,12 +58,12 @@ pub fn init_seams() {
 pub fn parse_analyze_fixedparams<'a, 'mcx>(
     mcx: Mcx<'mcx>,
     parse_tree: &'a RawStmt<'mcx>,
-    source_text: &'a str,
+    source_text: &'mcx str,
     param_types: &'a [Oid],
     query_env: QueryEnvHandle,
 ) -> PgResult<Query<'mcx>> {
     let mut pstate = make_parsestate(mcx, None);
-    pstate.p_sourcetext = Some(mcx::slice_in(mcx, source_text.as_bytes())?.leak());
+    pstate.p_sourcetext = Some(source_text.as_bytes());
 
     if !param_types.is_empty() {
         setup_parse_fixed_parameters(&mut pstate, param_types);
@@ -94,7 +94,7 @@ pub fn parse_analyze_fixedparams<'a, 'mcx>(
 pub fn parse_analyze_sql_fn<'a, 'mcx>(
     mcx: Mcx<'mcx>,
     parse_tree: &'a RawStmt<'mcx>,
-    source_text: &'a str,
+    source_text: &'mcx str,
     fname: &'a str,
     argtypes: &'a [Oid],
     argnames: &'a [&'a str],
@@ -102,7 +102,7 @@ pub fn parse_analyze_sql_fn<'a, 'mcx>(
     query_env: QueryEnvHandle,
 ) -> PgResult<Query<'mcx>> {
     let mut pstate = make_parsestate(mcx, None);
-    pstate.p_sourcetext = Some(mcx::slice_in(mcx, source_text.as_bytes())?.leak());
+    pstate.p_sourcetext = Some(source_text.as_bytes());
 
     parser_small1::setup_parse_sql_fn_parameters(
         &mut pstate,
@@ -135,13 +135,13 @@ pub fn parse_analyze_sql_fn<'a, 'mcx>(
 pub fn transform_stmt_sql_fn<'a, 'mcx>(
     mcx: Mcx<'mcx>,
     stmt: Node<'mcx>,
-    source_text: &'a str,
+    source_text: &'mcx str,
     fname: &'a str,
     argtypes: &'a [Oid],
     argnames: &'a [&'a str],
 ) -> PgResult<Query<'mcx>> {
     let mut pstate = make_parsestate(mcx, None);
-    pstate.p_sourcetext = Some(mcx::slice_in(mcx, source_text.as_bytes())?.leak());
+    pstate.p_sourcetext = Some(source_text.as_bytes());
 
     parser_small1::setup_parse_sql_fn_parameters(
         &mut pstate,
@@ -165,12 +165,12 @@ pub fn transform_stmt_sql_fn<'a, 'mcx>(
 pub fn parse_analyze_varparams<'a, 'mcx>(
     mcx: Mcx<'mcx>,
     parse_tree: &'a RawStmt<'mcx>,
-    source_text: &'a str,
+    source_text: &'mcx str,
     param_types: &'a [Oid],
     query_env: QueryEnvHandle,
 ) -> PgResult<(Query<'mcx>, mcx::PgVec<'mcx, Oid>)> {
     let mut pstate = make_parsestate(mcx, None);
-    pstate.p_sourcetext = Some(mcx::slice_in(mcx, source_text.as_bytes())?.leak());
+    pstate.p_sourcetext = Some(source_text.as_bytes());
 
     let parstate = parser_small1::VarParamState {
         param_types: std::rc::Rc::new(core::cell::RefCell::new(param_types.to_vec())),
@@ -219,12 +219,12 @@ pub fn parse_analyze_varparams<'a, 'mcx>(
 pub fn parse_analyze_plpgsql<'a, 'mcx>(
     mcx: Mcx<'mcx>,
     parse_tree: &'a RawStmt<'mcx>,
-    source_text: &'a str,
+    source_text: &'mcx str,
     hooks: &'a parser_small1::PlpgsqlHookState<'a>,
     query_env: QueryEnvHandle,
 ) -> PgResult<Query<'mcx>> {
     let mut pstate = make_parsestate(mcx, None);
-    pstate.p_sourcetext = Some(mcx::slice_in(mcx, source_text.as_bytes())?.leak());
+    pstate.p_sourcetext = Some(source_text.as_bytes());
     pstate.p_ref_hook_state = parser_small1::ParseRefHookState::PlpgsqlParams(*hooks);
 
     if !query_env.is_null() {

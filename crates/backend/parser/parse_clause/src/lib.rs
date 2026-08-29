@@ -1773,7 +1773,7 @@ pub fn transformIndexStmt<'mcx>(
     mcx: Mcx<'mcx>,
     relid: Oid,
     stmt_node: Node<'mcx>,
-    query_string: &str,
+    query_string: &'mcx str,
 ) -> PgResult<()> {
     use types_nodes::rawnodes::{IndexElem, IndexStmt};
     let (transformed, where_clause, params) = {
@@ -1787,7 +1787,7 @@ pub fn transformIndexStmt<'mcx>(
     }
 
     let mut pstate = parser_small1::make_parsestate(mcx, None);
-    pstate.p_sourcetext = Some(bytes_in(mcx, query_string.as_bytes())?);
+    pstate.p_sourcetext = Some(query_string.as_bytes());
 
     let rel = table::table_open(mcx, relid, types_rel::NoLock)?;
     let nsitem = parse_relation::addRangeTableEntryForRelation(
@@ -1860,7 +1860,7 @@ pub fn transformStatsStmt<'mcx>(
     mcx: Mcx<'mcx>,
     relid: Oid,
     stmt_node: Node<'mcx>,
-    query_string: &str,
+    query_string: &'mcx str,
 ) -> PgResult<()> {
     use types_nodes::rawnodes::{CreateStatsStmt, StatsElem};
     let (transformed, exprs) = {
@@ -1874,7 +1874,7 @@ pub fn transformStatsStmt<'mcx>(
     }
 
     let mut pstate = parser_small1::make_parsestate(mcx, None);
-    pstate.p_sourcetext = Some(bytes_in(mcx, query_string.as_bytes())?);
+    pstate.p_sourcetext = Some(query_string.as_bytes());
 
     // C: relation_open — CREATE STATISTICS on an index/composite type must
     // reach CreateStatistics' own relkind error, not table_open's guard.
@@ -1918,12 +1918,6 @@ fn stats_expr_other_table() -> Box<PgError> {
         PgError::error("statistics expressions can refer only to the table being referenced")
             .with_sqlstate(ERRCODE_INVALID_COLUMN_REFERENCE),
     )
-}
-
-fn bytes_in<'mcx>(mcx: Mcx<'mcx>, b: &[u8]) -> PgResult<&'mcx [u8]> {
-    let mut v: mcx::PgVec<'mcx, u8> = mcx::vec_with_capacity_in(mcx, b.len())?;
-    mcx::vec_append_bytes(&mut v, b)?;
-    Ok(v.leak())
 }
 
 /// C `transformOnConflictArbiter` (parse_clause.c); returns

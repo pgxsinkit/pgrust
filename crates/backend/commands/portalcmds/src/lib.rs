@@ -75,6 +75,11 @@ pub fn PerformCursorOpen(
     // it only after the stmts registry handle below is released.
     let pctx: &'static MemoryContext = unsafe { &*(&*plan_ctx as *const MemoryContext) };
     let pmcx = pctx.mcx();
+    // The plan arena outlives this message (a WITH HOLD cursor outlives its
+    // transaction), so the DECLARE text the re-analysis borrows is copied
+    // into it once here — C's pstrdup-into-portalContext, and the same single
+    // copy parse analysis used to make on every caller's behalf.
+    let stmt_text = mcx::str_in(pmcx, stmt_text)?;
 
     let raw = postgres::pg_parse_query(pmcx, stmt_text)?;
     assert!(raw.len() == 1, "DECLARE statement slice re-parsed to {} statements", raw.len());

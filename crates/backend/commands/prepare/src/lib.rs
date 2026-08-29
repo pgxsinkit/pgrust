@@ -137,8 +137,13 @@ fn fill_plansource(
     let inner = plancache::CachedPlanRawParseTreeCopy(qmcx, plansource)?
         .expect("created with a raw tree");
 
+    // The one copy this path needs: the plansource outlives the PREPARE
+    // message, so the source text its analyzed tree borrows must live in the
+    // plansource's query arena (C pstrdups into the CachedPlanSource).
+    let source_text = mcx::str_in(qmcx, source_text)?;
+
     let mut pstate = parser_small1::make_parsestate(qmcx, None);
-    pstate.p_sourcetext = Some(mcx::slice_in(qmcx, source_text.as_bytes())?.leak());
+    pstate.p_sourcetext = Some(source_text.as_bytes());
     let mut argtypes: mcx::PgVec<'_, types_core::Oid> =
         mcx::vec_with_capacity_in(qmcx, stmt.argtypes.len())?;
     for tn_node in stmt.argtypes.iter() {

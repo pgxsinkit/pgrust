@@ -6,3 +6,6 @@ assets/vfs.img
 assets/vfs.img.br
 assets/vfs.img.gz
 assets/vfs.json
+# The @pgxsinkit/pglite-opfs-repacked ESM bundle the `--fs broker` lane imports — a symlink to
+# another repo's dist output, never a checked-in copy. See wasm/broker-fs.js.
+vendor/

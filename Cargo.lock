@@ -13796,8 +13796,10 @@ dependencies = [
  "be_secure_seams",
  "elog",
  "fdnb",
+ "init_small",
  "ip",
  "ipc_seams",
+ "latch",
  "libc",
  "pgsync",
  "postgres_seams",
@@ -13808,6 +13810,7 @@ dependencies = [
  "types_error",
  "types_startup",
  "types_storage",
+ "waiter",
 ]
 
 [[package]]

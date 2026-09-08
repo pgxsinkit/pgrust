@@ -770,10 +770,26 @@ pub fn postmaster_child_launch(
 // (or the max_stack_depth budget + slop when the GUC was raised above that):
 // reserve is address space only, but 64MiB x max_connections=500 was 32 GB
 // of VSZ for zero benefit under `ulimit -s unlimited`.
+//
+// Except on wasm, where "reserve is address space only" is false. WASI has no
+// rlimit (get_stack_depth_rlimit() is the -1 arm), so every child takes the
+// unlimited reserve — and a wasm thread stack is malloc'd out of the ONE
+// shared linear memory, so the reserve is bytes the memory has to grow by and
+// the browser tab has to make resident. A postmaster spawns ~10 children
+// before the first backend: at 16MiB that is 160MiB of a phone's per-tab
+// budget spent on stacks nothing touches. The floor is 4MiB there, and
+// max_stack_depth (which the caller sets, and which still dominates this max
+// when it is raised) remains the thing that decides how deep a backend may
+// actually recurse.
+#[cfg(target_family = "wasm")]
+const UNLIMITED_STACK_RESERVE: usize = 4 << 20;
+#[cfg(not(target_family = "wasm"))]
+const UNLIMITED_STACK_RESERVE: usize = 16 << 20;
+
 fn child_thread_stack_size() -> usize {
     let rlim = stack_depth::get_stack_depth_rlimit();
-    let unlimited_reserve =
-        (16usize << 20).max(stack_depth::max_stack_depth_bytes().max(0) as usize + (2 << 20));
+    let unlimited_reserve = UNLIMITED_STACK_RESERVE
+        .max(stack_depth::max_stack_depth_bytes().max(0) as usize + (2 << 20));
     let rlim = if rlim > 0 && rlim < isize::MAX { rlim as usize } else { unlimited_reserve };
     let min_stack = std::env::var("RUST_MIN_STACK")
         .ok()

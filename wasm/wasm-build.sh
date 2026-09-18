@@ -229,19 +229,82 @@ case "$PROFILE" in
     dev) PROFILE_DIR=debug ;;
     *)   PROFILE_DIR="$PROFILE" ;;
 esac
+
+# THE RELEASE CODEGEN SETTINGS LIVE HERE, NOT IN `[profile.wasm-release]`.
+#
+# The manifest's profile is `opt-level = "s"`, `lto = false`, `codegen-units =
+# 16` — chosen for size before anyone measured it for speed — and the root
+# Cargo.toml is UPSTREAM'S FILE. This spike line is rebased onto upstream, so
+# every byte of that manifest we leave alone is a conflict a squash rebase does
+# not have to resolve. Cargo's environment overrides reach the custom profile
+# exactly as an edit would (`main_main profile: {"opt_level": "3", "lto":
+# "fat", "codegen_units": 1}` in cargo's own unit graph, and `-C opt-level=3
+# -C lto -C codegen-units=1` on the rustc lines), so the shipped module is the
+# fast one and the manifest still matches upstream byte for byte.
+#
+# What it is worth, from pglite-v-pgrust
+# `docs/results/2026-09-18-speed-first-profile.md` — browser Speedtest,
+# `pgrust-postmaster-opfs-repacked-relaxed`, two interleaved rounds each,
+# headless Chromium 149 on one machine, Suite totals in ms summed over both
+# rounds (lower is better):
+#
+#     size-first ("s"/false/16, -Oz)   46 508   37 210 023 raw / 12 820 980 gz
+#     this build (3/fat/1,      -Oz)   40 396   40 127 758 raw / 14 039 196 gz
+#     same link with -O3               40 475   40 635 385 raw / 14 112 911 gz
+#
+# (gzip -9 -n, so the numbers are the content and not the stored filename.)
+#
+# 13% off the Suite total for +2.9 MB raw / +1.2 MB gzipped: 1.37x on the big
+# transactional write, 1.24-1.29x on the indexed update, select and delete
+# rows, and 0.93x on row 1 (1000 autocommit INSERTs), which is the one row that
+# gets slower. `-Oz` and `-O3` over the same fat-LTO link are 0.2% apart on the
+# Suite — inside the round-to-round spread — so the smaller of the two is the
+# default below.
+#
+# Every variable here is overridable. THE OLD SIZE-FIRST BUILD IS:
+#
+#     CARGO_PROFILE_WASM_RELEASE_OPT_LEVEL=s \
+#     CARGO_PROFILE_WASM_RELEASE_LTO=false \
+#     CARGO_PROFILE_WASM_RELEASE_CODEGEN_UNITS=16 \
+#       PGRUST_WASM_PROFILE=wasm-release wasm/wasm-build.sh
+#
+# It costs: a profile change invalidates every unit in the target directory, so
+# the first build after flipping any of these recompiles build-std and the
+# whole graph — 9 to 10.5 minutes per target here, against roughly two for the
+# size-first profile — and a relink of main_main alone into a warm directory is
+# still 6 minutes, almost all of it the LTO step. The Binaryen pass is another
+# ~3.7 minutes on top, per target.
+WASM_OPT_LEVEL="${PGRUST_WASM_OPT_LEVEL:--Oz}"
+PROFILE_DESC=""
+if [ "$PROFILE" = "wasm-release" ]; then
+    export CARGO_PROFILE_WASM_RELEASE_OPT_LEVEL="${CARGO_PROFILE_WASM_RELEASE_OPT_LEVEL:-3}"
+    export CARGO_PROFILE_WASM_RELEASE_LTO="${CARGO_PROFILE_WASM_RELEASE_LTO:-fat}"
+    export CARGO_PROFILE_WASM_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_WASM_RELEASE_CODEGEN_UNITS:-1}"
+    if [ "${PGRUST_WASM_OPT:-1}" = "0" ]; then
+        WASM_OPT_DESC="wasm-opt skipped"
+    else
+        WASM_OPT_DESC="wasm-opt ${WASM_OPT_LEVEL}"
+    fi
+    PROFILE_DESC=" [opt-level ${CARGO_PROFILE_WASM_RELEASE_OPT_LEVEL}, lto ${CARGO_PROFILE_WASM_RELEASE_LTO}, codegen-units ${CARGO_PROFILE_WASM_RELEASE_CODEGEN_UNITS}, ${WASM_OPT_DESC}]"
+fi
+
 if [ "${PGRUST_WASM_SKIP_LINK:-0}" != "1" ]; then
     prove_feature_exclusion
     cargo +"${TOOLCHAIN}" build --target "$TARGET" -Zbuild-std=std,panic_unwind -p main_main --bin postgres --profile "$PROFILE" \
         --no-default-features --features "$FEATURES"
     BIN_WASM="$ROOT/target/${TARGET}/${PROFILE_DIR}/postgres.wasm"
     [ -f "$BIN_WASM" ] || { echo "wasm-build: FAIL — postgres.wasm not produced" >&2; exit 1; }
-    echo "wasm-build: postgres.wasm linked ($(du -h "$BIN_WASM" | cut -f1), profile $PROFILE, features $FEATURES)"
+    echo "wasm-build: postgres.wasm linked ($(du -h "$BIN_WASM" | cut -f1), profile ${PROFILE}${PROFILE_DESC}, features $FEATURES)"
 
     # Binaryen pass — release profile only (dev builds are untouched), opt out
-    # with PGRUST_WASM_OPT=0. `[profile.wasm-release]` is `lto = false` with
-    # `codegen-units = 16`, so the link leaves duplicate function bodies
-    # behind; `wasm-opt -Oz` finds them and takes ~27% off the raw bytes
-    # (measured in pglite-v-pgrust docs/results/2026-09-08-wasm-size-map.md §9).
+    # with PGRUST_WASM_OPT=0, level from PGRUST_WASM_OPT_LEVEL (default `-Oz`).
+    # Under the size-first profile above (`lto = false`, `codegen-units = 16`)
+    # the link left duplicate function bodies behind and `-Oz` took ~27% off
+    # the raw bytes (pglite-v-pgrust docs/results/2026-09-08-wasm-size-map.md
+    # §9). Fat LTO does that deduplication in the compiler, so the pass now
+    # takes ~13% instead — but it is still 5.7 MB, and `-Oz` is both smaller
+    # (by 508 KB) and, within the noise, no slower than `-O3` on this link
+    # (docs/results/2026-09-18-speed-first-profile.md).
     if [ "$PROFILE" = "wasm-release" ] && [ "${PGRUST_WASM_OPT:-1}" != "0" ]; then
         # The feature list is spelled out ONCE, here, and is deliberately NOT
         # `--all-features`: the release profile strips the module's
@@ -272,10 +335,10 @@ if [ "${PGRUST_WASM_SKIP_LINK:-0}" != "1" ]; then
         fi
         WASM_OPT_BEFORE=$(wc -c < "$BIN_WASM")
         WASM_OPT_T0=$SECONDS
-        wasm-opt -Oz "${WASM_OPT_FEATURES[@]}" "$BIN_WASM" -o "$BIN_WASM.opt"
+        wasm-opt "$WASM_OPT_LEVEL" "${WASM_OPT_FEATURES[@]}" "$BIN_WASM" -o "$BIN_WASM.opt"
         mv "$BIN_WASM.opt" "$BIN_WASM"
         WASM_OPT_AFTER=$(wc -c < "$BIN_WASM")
-        echo "wasm-build: wasm-opt -Oz ${WASM_OPT_BEFORE} -> ${WASM_OPT_AFTER} bytes (-$(( (WASM_OPT_BEFORE - WASM_OPT_AFTER) * 100 / WASM_OPT_BEFORE ))%) in $((SECONDS - WASM_OPT_T0))s ($(wasm-opt --version))"
+        echo "wasm-build: wasm-opt ${WASM_OPT_LEVEL} ${WASM_OPT_BEFORE} -> ${WASM_OPT_AFTER} bytes (-$(( (WASM_OPT_BEFORE - WASM_OPT_AFTER) * 100 / WASM_OPT_BEFORE ))%) in $((SECONDS - WASM_OPT_T0))s ($(wasm-opt --version))"
     fi
 else
     echo "wasm-build: bin link SKIPPED (PGRUST_WASM_SKIP_LINK=1)"

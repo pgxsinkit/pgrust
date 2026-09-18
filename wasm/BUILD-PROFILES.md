@@ -251,3 +251,66 @@ Two files, run through the threaded wire lane's `--sql` runner, split because th
 not available` (0A000) on **every** profile, the full one included, and proves nothing. `LOAD 'name'`
 goes straight to dfmgr's named-builtin-library lookup — the registration a contrib crate performs
 from its `init_seams()`, and precisely the thing a feature gate removes.
+
+## The release build is the fast one now (2026-09-19)
+
+The 2026-09-07 experiment at the top of this file left the profile alone, and said why: the bar it
+set was ≥1.5× on the write-heavy rows and B did not clear it. The module has changed three times
+since — the 0.3 rebase, the `browser` feature set, the `wasm-opt -Oz` pass — so the bench remeasured
+it on the module actually published (`pglite-v-pgrust`
+`docs/results/2026-09-18-speed-first-profile.md`), and this time the bar was the owner's: **lowest
+browser Speedtest total summed over two interleaved rounds wins; two arms within 3% of each other
+are settled by size, smaller wins; and the module may not exceed 46 431 092 raw bytes.**
+
+Three arms, all `wasm32-wasip1-threads` with `PGRUST_WASM_FEATURES=browser`, interleaved A, D, D2,
+A, D, D2 against the same `pglite-memory` control, one module swap between runs and nothing else
+touched:
+
+| Arm | opt-level / lto / codegen-units | Binaryen | raw | gzip -9 -n | Suite r1 / r2 | sum |
+| --- | --- | --- | --- | --- | --- | --- |
+| A — as published | `"s"` / `false` / 16 | `-Oz` | 37 210 023 | 12 820 980 | 23 153 / 23 355 | 46 508 |
+| D | 3 / `"fat"` / 1 | `-O3` | 40 635 385 | 14 112 911 | 20 159 / 20 315 | 40 475 |
+| **D2 — adopted** | 3 / `"fat"` / 1 | `-Oz` | **40 127 758** | **14 039 196** | 20 197 / 20 199 | **40 396** |
+
+(The gzip column is `gzip -9 -n`; the bench note's tables were taken without `-n` and so run 10–11
+bytes higher, which is the filename gzip stores in the header.)
+
+**D2 wins.** D and D2 are 0.20% apart on the two-round sum — the same link, so this is the Binaryen
+level and nothing else — which is well inside the 3% the rule allows and inside each arm's own
+round-to-round spread (0.0–0.9%), so size decides it and `-Oz` is 507 627 bytes smaller than `-O3`.
+A, in the same session as the control, is 15.1% slower than D2 over the two rounds, against its own
+0.9% round-to-round spread: the profile is a real effect and the Binaryen level still is not. The
+adopted module is 6 303 334 bytes under the cap.
+
+Per row, best of two against A: 1.37× on the big transactional write (test 2), 1.29× on indexed
+SELECTs (7), 1.26× on indexed UPDATEs (9) and indexed DELETEs (13), 1.24× on unindexed UPDATEs (8),
+1.16× on text UPDATEs (10) — and 0.93× on test 1, 1000 autocommit INSERTs, the one row that gets
+slower and the same row the 0.3 line had already lost.
+
+So `wasm/wasm-build.sh` now exports `CARGO_PROFILE_WASM_RELEASE_OPT_LEVEL=3`,
+`…_LTO=fat`, `…_CODEGEN_UNITS=1` under `PGRUST_WASM_PROFILE=wasm-release`, and takes the Binaryen
+level from `PGRUST_WASM_OPT_LEVEL` (default `-Oz`). All four are overridable and the old size-first
+build is three variables away (`s`, `false`, `16`); `PGRUST_WASM_OPT=0` still skips the pass
+entirely. **`[profile.wasm-release]` in the root `Cargo.toml` is untouched** — that file is
+upstream's, and a squash rebase should find nothing of ours in it. The `postgres.wasm linked` line
+now prints the effective settings so a build log says which module it is.
+
+Both modules rebuilt from those defaults, nothing in the environment:
+
+| Module | size-first raw | speed-first raw | gzip -9 -n | sha256 |
+| --- | --- | --- | --- | --- |
+| `wasm32-wasip1-threads` | 37 210 023 | **40 127 758** | 14 039 196 | `765b06fb…` |
+| `wasm32-wasip1` | 36 585 135 | **39 343 973** | 14 073 961 | `e6ef0b4d…` |
+
+The threads module came out byte-identical to the arm that was measured, which is the point of
+putting the settings in the script: the numbers above are the numbers for what ships.
+
+What it costs, per target, on the i7-1165G7. A profile change invalidates every unit in the target
+directory, so the first build after flipping any of these variables recompiles build-std and the
+whole graph, not an increment: **8 m 57 s** for `wasm32-wasip1` here, 10 m 28 s for the same work on
+the threads target during the bench (the 2026-09-07 fat-LTO run measured 812 s), against roughly two
+minutes for the size-first profile. A relink of `main_main` alone into an otherwise warm target
+directory is 6 m 01 s, almost all of it the LTO step. Then `wasm-opt -Oz` on top, 221 s for the
+threads module and 230 s for the single-session one, taking 12–13% off rather than the 27% it took
+off the `codegen-units = 16` link — fat LTO has already removed the duplicate bodies the pass used
+to find.

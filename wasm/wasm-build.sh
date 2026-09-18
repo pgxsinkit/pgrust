@@ -275,6 +275,22 @@ esac
 # still 6 minutes, almost all of it the LTO step. The Binaryen pass is another
 # ~3.7 minutes on top, per target.
 WASM_OPT_LEVEL="${PGRUST_WASM_OPT_LEVEL:--Oz}"
+
+# Extra Binaryen flags, after the level. The default turns OFF one-caller
+# inlining (Binaryen inlines every function with exactly one call site, at any
+# size, from -O2 up), which on this link folds 21.6% of the module's functions
+# into their callers and hands V8 a small number of enormous ones. The browser
+# has to COMPILE what Binaryen builds: TurboFan spends 14.5s of CPU on the
+# inlined module against 6.2s without it, and the first workload after boot
+# (1000 autocommit INSERTs) takes ~1200ms instead of ~515ms. It is not a size
+# trade either — the module is 122 820 B SMALLER without the inlining.
+# Measured in pglite-v-pgrust
+# docs/findings/0002-pgrust-autocommit-insert-regression.md.
+# PGRUST_WASM_OPT_EXTRA="" restores stock `-Oz`.
+WASM_OPT_EXTRA="${PGRUST_WASM_OPT_EXTRA:---one-caller-inline-max-function-size=0}"
+WASM_OPT_EXTRA_ARGS=()
+[ -n "$WASM_OPT_EXTRA" ] && read -r -a WASM_OPT_EXTRA_ARGS <<< "$WASM_OPT_EXTRA"
+
 PROFILE_DESC=""
 if [ "$PROFILE" = "wasm-release" ]; then
     export CARGO_PROFILE_WASM_RELEASE_OPT_LEVEL="${CARGO_PROFILE_WASM_RELEASE_OPT_LEVEL:-3}"
@@ -283,7 +299,7 @@ if [ "$PROFILE" = "wasm-release" ]; then
     if [ "${PGRUST_WASM_OPT:-1}" = "0" ]; then
         WASM_OPT_DESC="wasm-opt skipped"
     else
-        WASM_OPT_DESC="wasm-opt ${WASM_OPT_LEVEL}"
+        WASM_OPT_DESC="wasm-opt ${WASM_OPT_LEVEL}${WASM_OPT_EXTRA:+ ${WASM_OPT_EXTRA}}"
     fi
     PROFILE_DESC=" [opt-level ${CARGO_PROFILE_WASM_RELEASE_OPT_LEVEL}, lto ${CARGO_PROFILE_WASM_RELEASE_LTO}, codegen-units ${CARGO_PROFILE_WASM_RELEASE_CODEGEN_UNITS}, ${WASM_OPT_DESC}]"
 fi
@@ -335,10 +351,10 @@ if [ "${PGRUST_WASM_SKIP_LINK:-0}" != "1" ]; then
         fi
         WASM_OPT_BEFORE=$(wc -c < "$BIN_WASM")
         WASM_OPT_T0=$SECONDS
-        wasm-opt "$WASM_OPT_LEVEL" "${WASM_OPT_FEATURES[@]}" "$BIN_WASM" -o "$BIN_WASM.opt"
+        wasm-opt "$WASM_OPT_LEVEL" ${WASM_OPT_EXTRA_ARGS+"${WASM_OPT_EXTRA_ARGS[@]}"} "${WASM_OPT_FEATURES[@]}" "$BIN_WASM" -o "$BIN_WASM.opt"
         mv "$BIN_WASM.opt" "$BIN_WASM"
         WASM_OPT_AFTER=$(wc -c < "$BIN_WASM")
-        echo "wasm-build: wasm-opt ${WASM_OPT_LEVEL} ${WASM_OPT_BEFORE} -> ${WASM_OPT_AFTER} bytes (-$(( (WASM_OPT_BEFORE - WASM_OPT_AFTER) * 100 / WASM_OPT_BEFORE ))%) in $((SECONDS - WASM_OPT_T0))s ($(wasm-opt --version))"
+        echo "wasm-build: wasm-opt ${WASM_OPT_LEVEL}${WASM_OPT_EXTRA:+ ${WASM_OPT_EXTRA}} ${WASM_OPT_BEFORE} -> ${WASM_OPT_AFTER} bytes (-$(( (WASM_OPT_BEFORE - WASM_OPT_AFTER) * 100 / WASM_OPT_BEFORE ))%) in $((SECONDS - WASM_OPT_T0))s ($(wasm-opt --version))"
     fi
 else
     echo "wasm-build: bin link SKIPPED (PGRUST_WASM_SKIP_LINK=1)"

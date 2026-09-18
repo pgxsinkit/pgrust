@@ -314,3 +314,47 @@ directory is 6 m 01 s, almost all of it the LTO step. Then `wasm-opt -Oz` on top
 threads module and 230 s for the single-session one, taking 12–13% off rather than the 27% it took
 off the `codegen-units = 16` link — fat LTO has already removed the duplicate bodies the pass used
 to find.
+
+## The browser has to compile what Binaryen builds (2026-09-19)
+
+D2 above wins the Suite but loses row 1 — 1000 autocommit INSERTs, 0.93× — and that row had been
+written off as "the one the 0.3 line had already lost". It was not the line. It was our own Binaryen
+pass. `pglite-v-pgrust` `docs/findings/0002-pgrust-autocommit-insert-regression.md` has the
+measurement: Binaryen inlines every function with exactly one call site, at any size, from `-O2` up
+(`-Oz` included), which on this fat-LTO link folds **21.6% of the module's functions** into their
+single callers and hands V8 a smaller number of much larger ones. V8's TurboFan then spends **14.5 s
+of CPU compiling the module against 6.2 s** without it, and the first workload after boot pays for
+it: row 1 runs at ~1200 ms instead of ~515 ms. Nothing later in the Suite pays, because by then the
+tiering-up is done.
+
+`--one-caller-inline-max-function-size=0` turns that one heuristic off and leaves the rest of `-Oz`
+alone. The same link, the same two-interleaved-round rule, order D2, NEW, D2, NEW against the same
+`pglite-memory` control:
+
+| Arm | Binaryen | raw | gzip -9 -n | row 1 (r1 / r2) | Suite r1 / r2 | sum |
+| --- | --- | --- | --- | --- | --- | --- |
+| D2 — as published | `-Oz` | 40 127 758 | 14 039 196 | 1279 / 1242 | 19 974 / 20 125 | 40 099 |
+| **NEW — adopted** | `-Oz --one-caller-inline-max-function-size=0` | **40 004 938** | **13 886 510** | **508 / 512** | 19 061 / 19 012 | **38 072** |
+
+**NEW wins on the rule's own metric, by 5.32%** — outside the 3% band, so size never has to decide
+it — and it is the smaller module anyway, by 122 820 raw bytes. The `pglite-memory` control held to
+1.4% across the four runs. Row 1 is 2.44× faster and no row regresses beyond the round-to-round
+spread. There is no trade here to weigh: this is smaller AND faster, which is what you get when the
+thing you removed was work done to make a compiler's job harder.
+
+So `wasm/wasm-build.sh` takes the extra Binaryen flags from `PGRUST_WASM_OPT_EXTRA`, default
+`--one-caller-inline-max-function-size=0`, passed after `PGRUST_WASM_OPT_LEVEL`. Both are
+overridable and `PGRUST_WASM_OPT_EXTRA=` restores stock `-Oz`. The effective string is in the
+`postgres.wasm linked` line and the `wasm-opt` line, so a build log still says which module it is.
+
+Both modules rebuilt from those defaults, nothing in the environment:
+
+| Module | previous raw | this raw | gzip -9 -n | sha256 |
+| --- | --- | --- | --- | --- |
+| `wasm32-wasip1-threads` | 40 127 758 | **40 004 938** | 13 886 510 | `df17f7e2…` |
+| `wasm32-wasip1` | 39 343 973 | **39 160 862** | 13 899 026 | `0d772984…` |
+
+The threads module is byte-identical to the arm that was measured. Both are under the 46 431 092-byte
+cap, the threads one by 6 426 154 bytes. The pass costs 163 s per target here (it was 221 s and
+230 s with the inlining on), into an already-warm target directory — this flag changes nothing in
+cargo's unit graph, so adopting it is a re-uplift and a Binaryen pass, not a rebuild.

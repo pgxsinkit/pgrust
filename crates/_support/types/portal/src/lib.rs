@@ -107,6 +107,24 @@ pub enum PortalCleanupHook {
     PortalCleanup,
 }
 
+// C's portal->sourceText. PortalDefineQuery's copy is the portal's own (C's
+// callers copy into portalContext); only exec_simple_query shares its message.
+pub enum PortalSourceText<'mcx> {
+    Owned(PgString<'mcx>),
+    Shared(&'mcx str),
+}
+
+impl core::ops::Deref for PortalSourceText<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            PortalSourceText::Owned(s) => s.as_str(),
+            PortalSourceText::Shared(s) => s,
+        }
+    }
+}
+
 // PortalData (utils/portal.h); 'mcx is the manager's context (TopPortalContext).
 // portalContext/holdContext are PgBox'd for address stability across moves.
 pub struct PortalData<'mcx> {
@@ -120,7 +138,7 @@ pub struct PortalData<'mcx> {
     pub activeSubid: SubTransactionId,
     pub createLevel: i32,
 
-    pub sourceText: Option<&'mcx str>,
+    pub sourceText: Option<PortalSourceText<'mcx>>,
     pub commandTag: CommandTag,
     pub qc: QueryCompletion,
     pub stmts: StmtListHandle,

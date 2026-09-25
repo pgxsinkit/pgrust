@@ -20,8 +20,8 @@ use ::types_error::{
 };
 use ::types_portal::{
     CachedPlanHandle, ParamListHandle, PlanSourceHandle, Portal, PortalCleanupHook, PortalData,
-    QueryCompletion, QueryDescHandle, QueryEnvHandle, StmtListHandle, TuplestoreHandle,
-    CMDTAG_UNKNOWN,
+    PortalSourceText, QueryCompletion, QueryDescHandle, QueryEnvHandle, StmtListHandle,
+    TuplestoreHandle, CMDTAG_UNKNOWN,
     CURSOR_OPT_BINARY, CURSOR_OPT_HOLD, CURSOR_OPT_NO_SCROLL, CURSOR_OPT_SCROLL,
     MAX_PORTALNAME_LEN, PORTAL_ACTIVE, PORTAL_DEFINED, PORTAL_DONE, PORTAL_FAILED,
     PORTAL_MULTI_QUERY, PORTAL_NEW, PORTAL_ONE_SELECT, PORTAL_READY,
@@ -476,9 +476,8 @@ pub fn PortalDefineQuery(
         Some(s) => Some(PgString::from_str_in(s, mcx)?),
         None => None,
     };
-    let copy: &'static [u8] = mcx::slice_in(mcx, sourceText.as_bytes())?.leak();
-    // SAFETY: copied from a `&str`.
-    p.sourceText = Some(unsafe { core::str::from_utf8_unchecked(copy) });
+    // The portal's own copy: PortalDrop frees it; a parked shell keeps it.
+    p.sourceText = Some(PortalSourceText::Owned(PgString::from_str_in(sourceText, mcx)?));
     p.status = PORTAL_DEFINED;
     Ok(())
 }
@@ -504,7 +503,7 @@ pub unsafe fn PortalDefineQuerySharedText<'a>(
     p.qc = QueryCompletion { commandTag, nprocessed: 0 };
     p.commandTag = commandTag;
     p.prepStmtName = None;
-    p.sourceText = Some(shared);
+    p.sourceText = Some(PortalSourceText::Shared(shared));
     p.status = PORTAL_DEFINED;
 }
 
@@ -738,6 +737,7 @@ pub fn PortalDrop(portal: &Portal<'static>, isTopCommit: bool) -> PgResult<()> {
     let (ctx, hold_ctx) = {
         let mut p = portal.borrow_mut();
         p.tupDesc = None; // may live in portalContext/holdContext: free before the arenas
+        p.sourceText = None; // C deletes the caller's copy with portalContext
         (p.portalContext.take(), p.holdContext.take())
     };
     // Park empty contexts whole (C's AllocSetDelete -> context_freelists):
@@ -952,6 +952,7 @@ fn discard_shell(shell: &Portal<'static>) {
     let (query_desc, stmts, cplan, ctx) = {
         let mut p = shell.borrow_mut();
         p.tupDesc = None;
+        p.sourceText = None;
         (
             core::mem::replace(&mut p.queryDesc, QueryDescHandle::NULL),
             core::mem::replace(&mut p.stmts, StmtListHandle::NULL),

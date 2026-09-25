@@ -925,7 +925,7 @@ pub fn exec_execute_message<'mcx>(
         let is_xact = !stmts.is_null()
             && pquery::stmt_list::with(stmts, IsTransactionStmtList);
         let src = PgString::from_str_in(
-            p.sourceText.unwrap_or(""),
+            p.sourceText.as_deref().unwrap_or(""),
             mcx,
         )?;
         let prep = PgString::from_str_in(

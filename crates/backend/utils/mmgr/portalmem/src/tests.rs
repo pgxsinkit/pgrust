@@ -228,7 +228,7 @@ fn define_query_stores_and_shares_handles() {
     {
         let p = portal.borrow();
         assert_eq!(p.status, PORTAL_DEFINED);
-        assert_eq!(p.sourceText.unwrap(), "select 1");
+        assert_eq!(p.sourceText.as_deref().unwrap(), "select 1");
         assert_eq!(p.prepStmtName.as_ref().unwrap().as_str(), "ps1");
         assert_eq!(p.stmts, StmtListHandle(5));
         assert_eq!(p.cplan, CachedPlanHandle(11));
@@ -239,6 +239,27 @@ fn define_query_stores_and_shares_handles() {
     assert!(events().contains(&"release_cplan(11)".to_owned()));
     assert!(portal.borrow().cplan.is_null());
     assert!(portal.borrow().stmts.is_null());
+}
+
+// Bind, EXECUTE, DECLARE and SPI define through PortalDefineQuery: its copy of
+// the text must die with the portal, not stay in session-lifetime
+// TopPortalContext (4 KiB a statement here if it leaks).
+#[test]
+fn define_query_text_is_freed_with_the_portal() {
+    setup();
+    let top_used = || with_mgr(|m| m.top.used()).unwrap();
+    let text = "x".repeat(4096);
+    let cycle = || {
+        let portal = CreatePortal("", false, false).unwrap();
+        define_simple(&portal, &text);
+        PortalDrop(&portal, false).unwrap();
+    };
+    cycle(); // warm the slot and context pools
+    let before = top_used();
+    for _ in 0..100 {
+        cycle();
+    }
+    assert_eq!(top_used(), before);
 }
 
 #[test]

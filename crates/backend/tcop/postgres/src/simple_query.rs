@@ -811,6 +811,10 @@ pub(crate) fn check_log_duration(was_logged: bool) -> (i32, String) {
         sample_rate: guc_tables::backing::log_statement_sample_rate(),
         xact_is_sampled: xact::xact_is_sampled(),
     };
+    // C reads the clock only when something logs durations.
+    if gucs.all_off() {
+        return (0, String::new());
+    }
     let diff_us =
         crate::get_current_timestamp() - xact::GetCurrentStatementStartTimestamp();
     check_log_duration_impl(was_logged, diff_us, &gucs, || {
@@ -826,6 +830,12 @@ pub(crate) struct LogDurationGucs {
     pub(crate) xact_is_sampled: bool,
 }
 
+impl LogDurationGucs {
+    fn all_off(&self) -> bool {
+        !self.log_duration && self.log_min_sample < 0 && self.log_min < 0 && !self.xact_is_sampled
+    }
+}
+
 // The C decision body, GUC/clock/PRNG-free for the deterministic units.
 pub(crate) fn check_log_duration_impl(
     was_logged: bool,
@@ -833,7 +843,7 @@ pub(crate) fn check_log_duration_impl(
     g: &LogDurationGucs,
     draw: impl FnOnce() -> f64,
 ) -> (i32, String) {
-    if !g.log_duration && g.log_min_sample < 0 && g.log_min < 0 && !g.xact_is_sampled {
+    if g.all_off() {
         return (0, String::new());
     }
 

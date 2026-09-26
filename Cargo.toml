@@ -893,6 +893,14 @@ members = [
     "crates/backend/utils/adt/pg_upgrade_support",
     "crates/bin/fuzzgen",
 ]
+# The patched allocator-api2 below is a path dependency, not a workspace member.
+exclude = ["vendor/allocator-api2"]
+
+# allocator-api2 0.2.21 with RawVec's growth path out of line, as std's RawVec keeps it: upstream
+# marks every RawVec method #[inline(always)], so each PgVec::push site carried the whole growth
+# path. Only inline attributes differ from crates.io; see vendor/allocator-api2/PGRUST.md.
+[patch.crates-io]
+allocator-api2 = { path = "vendor/allocator-api2" }
 
 [workspace.package]
 edition = "2021"

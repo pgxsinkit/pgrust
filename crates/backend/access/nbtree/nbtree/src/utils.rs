@@ -2221,10 +2221,22 @@ pub(crate) fn bt_end_vacuum_key(key: (::types_core::Oid, ::types_core::Oid)) -> 
 /// _bt_mkscankey; `itup: None` is the utility-statement arm. C divergence:
 /// Keys past tupnatts are SK_ISNULL with unset arguments, per C.
 pub fn bt_mkscankey(rel: &Relation<'_>, itup: Option<ITup>) -> PgResult<BtScanInsert> {
+    let mut key = BtScanInsert::new();
+    bt_mkscankey_into(rel, itup, &mut key)?;
+    Ok(key)
+}
+
+/// _bt_mkscankey into a caller-owned `BtScanInsert::new()`. A BtScanInsert is 2,336 bytes (32
+/// scan-key slots, as C's BTScanInsertData); returned through `PgResult` it was copied twice per
+/// index insert (into the Result, then out of it at the `?`). C fills a palloc'd one in place.
+pub fn bt_mkscankey_into(
+    rel: &Relation<'_>,
+    itup: Option<ITup>,
+    key: &mut BtScanInsert,
+) -> PgResult<()> {
     let tupdesc: &TupleDescData<'_> = &rel.rd_att;
     let indnkeyatts = rel.indnkeyatts();
-
-    let mut key = BtScanInsert::new();
+    debug_assert!(key.keys_len() == 0, "bt_mkscankey_into needs a fresh BtScanInsert");
     // SAFETY: caller guarantees `itup` points at a live index tuple.
     let tupnatts = match itup {
         Some(itup) => {
@@ -2282,7 +2294,7 @@ pub fn bt_mkscankey(rel: &Relation<'_>, itup: Option<ITup>) -> PgResult<BtScanIn
     // its untruncated prefix; the remaining entries stay initialized for the
     // utility arms.
     key.set_keysz((indnkeyatts as usize).min(tupnatts as usize));
-    Ok(key)
+    Ok(())
 }
 
 /// _bt_check_natts (nbtutils.c).

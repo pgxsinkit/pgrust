@@ -129,7 +129,8 @@ fn bt_doinsert<'mcx>(
     let mut is_unique = false;
     let mut checkingunique = !matches!(check_unique, IndexUniqueCheck::UNIQUE_CHECK_NO);
 
-    let mut itup_key = bt_mkscankey(rel, Some(itup))?;
+    let mut itup_key = BtScanInsert::new();
+    crate::utils::bt_mkscankey_into(rel, Some(itup), &mut itup_key)?;
     let mut frame = OrderProcFrame::new();
 
     if checkingunique {

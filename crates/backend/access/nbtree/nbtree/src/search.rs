@@ -434,11 +434,14 @@ fn missing_support_function(rel: &Relation<'_>, attno: usize) -> Box<PgError> {
     )))
 }
 
+#[derive(Clone, Copy)]
 enum StartKey {
     Data(usize),
     // Skip array's low_compare (true) / high_compare (false), by array index.
     SkipCompare(usize, bool),
-    NotNull(ScanKeyData),
+    // The synthesized NOT NULL key, kept in `bt_first`'s `notnull_key` (there is at most one:
+    // it ends the start-key scan).
+    NotNull,
 }
 
 #[derive(Clone, Copy)]
@@ -496,8 +499,12 @@ pub(crate) fn bt_first(ctx: &mut ScanCtx<'_, '_>, dir: ScanDirection) -> PgResul
     }
     *ctx.xs_nsearches += 1;
 
-    let mut start_keys: [Option<StartKey>; INDEX_MAX_KEYS as usize] =
-        [const { None }; INDEX_MAX_KEYS as usize];
+    // C's startKeys[] is an uninitialised stack array: entries [0, keysz) are written in order
+    // below and only those are read. A None-filled [Option<StartKey>; 32] (72 bytes an entry,
+    // for the NOT NULL arm's inline ScanKeyData) was a 2,304-byte memset on every _bt_first.
+    let mut start_keys: [MaybeUninit<StartKey>; INDEX_MAX_KEYS as usize] =
+        [const { MaybeUninit::uninit() }; INDEX_MAX_KEYS as usize];
+    let mut notnull_key: Option<ScanKeyData> = None;
     let mut keysz: usize = 0;
     let mut strat_total: StrategyNumber = BTEqualStrategyNumber;
 
@@ -566,7 +573,8 @@ pub(crate) fn bt_first(ctx: &mut ScanCtx<'_, '_>, dir: ScanDirection) -> PgResul
                                 BTLessStrategyNumber
                             };
                             strat_total = nn.sk_strategy;
-                            start_keys[keysz] = Some(StartKey::NotNull(nn));
+                            notnull_key = Some(nn);
+                            start_keys[keysz].write(StartKey::NotNull);
                             keysz += 1;
                             break; // NOT NULL keys use >/< strategy: done
                         }
@@ -586,7 +594,7 @@ pub(crate) fn bt_first(ctx: &mut ScanCtx<'_, '_>, dir: ScanDirection) -> PgResul
                         .expect("checked above")
                     }
                 };
-                start_keys[keysz] = Some(match chosen.expect("checked above") {
+                start_keys[keysz].write(match chosen.expect("checked above") {
                     Chosen::Idx(k) => StartKey::Data(k),
                     Chosen::Skip(a, low) => StartKey::SkipCompare(a, low),
                 });
@@ -654,18 +662,19 @@ pub(crate) fn bt_first(ctx: &mut ScanCtx<'_, '_>, dir: ScanDirection) -> PgResul
     let mut inskey = BtScanInsert::new();
 
     for (i, slot) in start_keys[..keysz].iter().enumerate() {
-        let bkey: &ScanKeyData = match slot.as_ref().expect("filled above") {
-            StartKey::Data(idx) => &ctx.so.keyData[*idx],
+        // SAFETY: entries [0, keysz) were written in order above; StartKey is Copy.
+        let bkey: &ScanKeyData = match unsafe { slot.assume_init() } {
+            StartKey::Data(idx) => &ctx.so.keyData[idx],
             StartKey::SkipCompare(a, low) => {
-                let arr = &ctx.so.arrayKeys[*a];
-                if *low {
+                let arr = &ctx.so.arrayKeys[a];
+                if low {
                     arr.low_compare.as_ref()
                 } else {
                     arr.high_compare.as_ref()
                 }
                 .expect("chosen skip compare exists")
             }
-            StartKey::NotNull(nn) => nn,
+            StartKey::NotNull => notnull_key.as_ref().expect("NOT NULL start key stored"),
         };
         debug_assert!(bkey.sk_attno as usize == i + 1);
 

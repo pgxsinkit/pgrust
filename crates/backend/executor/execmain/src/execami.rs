@@ -237,7 +237,7 @@ pub fn exec_re_scan<'mcx>(
             exec_re_scan(&mut g.outer, estate)
         }
         PlanStateNode::Limit(l) => {
-            let crate::procnode::LimitNode { state, outer } = l;
+            let crate::procnode::LimitNode { state, outer } = &mut **l;
             ::nodelimit::exec_rescan_limit(state, &mut **outer, estate)?;
             exec_re_scan(outer, estate)
         }
@@ -522,6 +522,7 @@ pub(crate) fn exec_re_scan_chg_forced<'mcx>(
         // ExecReScanResult: the outer rescan waits while its chgParam is
         // pending, so a false one-time filter never runs the child.
         PlanStateNode::Result(rs) => {
+            let rs = &mut **rs;
             rs.rs_done = false;
             rs.rs_checkqual = rs.resconstantqual.is_some();
             if let Some(outer) = rs.outer.as_deref_mut() {
@@ -714,7 +715,7 @@ pub(crate) fn exec_re_scan_chg_forced<'mcx>(
             )?;
         }
         PlanStateNode::Limit(l) => {
-            let crate::procnode::LimitNode { state, outer } = l;
+            let crate::procnode::LimitNode { state, outer } = &mut **l;
             ::nodelimit::exec_rescan_limit(state, &mut **outer, estate)?;
             exec_re_scan_with_chg(outer, base.lefttree.expect("Limit outer plan"), estate, chg)?;
         }

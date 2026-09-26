@@ -2060,7 +2060,7 @@ pub(crate) fn maybe_run_heap<'mcx, 'd>(
         let crate::procnode::PlanStateNode::SeqScan(ss) = node else {
             return miss("state-shape");
         };
-        ss
+        &mut **ss
     } else {
         let crate::procnode::PlanStateNode::Agg(aps) = node else {
             return miss("state-shape");
@@ -2068,7 +2068,7 @@ pub(crate) fn maybe_run_heap<'mcx, 'd>(
         let crate::procnode::PlanStateNode::SeqScan(ss) = &mut aps.outer else {
             return miss("state-shape");
         };
-        ss
+        &mut **ss
     };
     if ss.is_parallel() {
         return miss("run-parallel");

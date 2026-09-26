@@ -34,32 +34,32 @@ pub struct InstrumentedNode<'mcx> {
 }
 
 pub enum PlanStateNode<'mcx> {
-    Result(ResultState<'mcx>),
+    Result(PgBox<'mcx, ResultState<'mcx>>),
     ProjectSet(PgBox<'mcx, ProjectSetState<'mcx>>),
-    SeqScan(::nodeseqscan::SeqScanState<'mcx>),
+    SeqScan(PgBox<'mcx, ::nodeseqscan::SeqScanState<'mcx>>),
     SampleScan(PgBox<'mcx, ::nodesamplescan::SampleScanState<'mcx>>),
     FunctionScan(PgBox<'mcx, ::nodefunctionscan::FunctionScanState<'mcx>>),
     ValuesScan(PgBox<'mcx, ::nodevaluesscan::ValuesScanState<'mcx>>),
     TableFuncScan(PgBox<'mcx, ::nodetablefuncscan::TableFuncScanState<'mcx>>),
     CteScan(PgBox<'mcx, ::nodectescan::CteScanState<'mcx>>),
-    IndexScan(::nodeindexscan::IndexScanState<'mcx>),
-    TidScan(::nodetidscan::TidScanState<'mcx>),
-    TidRangeScan(::nodetidrangescan::TidRangeScanState<'mcx>),
+    IndexScan(PgBox<'mcx, ::nodeindexscan::IndexScanState<'mcx>>),
+    TidScan(PgBox<'mcx, ::nodetidscan::TidScanState<'mcx>>),
+    TidRangeScan(PgBox<'mcx, ::nodetidrangescan::TidRangeScanState<'mcx>>),
     IndexOnlyScan(PgBox<'mcx, ::nodeindexonlyscan::IndexOnlyScanState<'mcx>>),
     Agg(PgBox<'mcx, AggPlanState<'mcx>>),
-    Sort(SortNode<'mcx>),
+    Sort(PgBox<'mcx, SortNode<'mcx>>),
     IncrementalSort(PgBox<'mcx, IncrementalSortNode<'mcx>>),
     Material(PgBox<'mcx, MaterialNode<'mcx>>),
     Unique(PgBox<'mcx, UniqueNode<'mcx>>),
     Group(PgBox<'mcx, GroupNode<'mcx>>),
-    Limit(LimitNode<'mcx>),
+    Limit(PgBox<'mcx, LimitNode<'mcx>>),
     LockRows(PgBox<'mcx, LockRowsNode<'mcx>>),
     BitmapHeapScan(PgBox<'mcx, BitmapHeapPlanState<'mcx>>),
-    BitmapIndexScan(::nodebitmapindexscan::BitmapIndexScanState<'mcx>),
+    BitmapIndexScan(PgBox<'mcx, ::nodebitmapindexscan::BitmapIndexScanState<'mcx>>),
     BitmapAnd(PgBox<'mcx, BitmapCombineState<'mcx>>),
     BitmapOr(PgBox<'mcx, BitmapCombineState<'mcx>>),
     ModifyTable(PgBox<'mcx, ModifyTablePlanState<'mcx>>),
-    NestLoop(NestLoopNode<'mcx>),
+    NestLoop(PgBox<'mcx, NestLoopNode<'mcx>>),
     HashJoin(PgBox<'mcx, HashJoinNode<'mcx>>),
     MergeJoin(PgBox<'mcx, MergeJoinNode<'mcx>>),
     WindowAgg(PgBox<'mcx, WindowAggNode<'mcx>>),
@@ -400,7 +400,10 @@ pub struct MergeJoinNode<'mcx> {
 }
 
 // Init-time tree node touched by &mut per tuple; rule-9 budget covers the per-row carriers inside.
-const _: () = assert!(core::mem::size_of::<PlanStateNode<'static>>() <= 1024);
+// Every variant is boxed, so the node is a tag and one PgBox (three words): exec_init_node's
+// per-arm frames, `?` unwraps and parent fields move 24 bytes per node instead of the largest
+// inline state (1000 bytes when the scan states were stored inline), as C passes a PlanState*.
+const _: () = assert!(core::mem::size_of::<PlanStateNode<'static>>() <= 24);
 
 impl<'mcx> PlanStateNode<'mcx> {
     #[inline]
@@ -614,11 +617,8 @@ pub fn exec_init_node<'mcx>(
     let result = match node.node_tag() {
         NodeTag::T_Result => {
             stack_depth_core::with_own_frame(|| -> PgResult<PlanStateNode<'mcx>> {
-                Ok(PlanStateNode::Result(exec_init_result(
-                    node.as_result().unwrap(),
-                    estate,
-                    eflags,
-                )?))
+                let state = exec_init_result(node.as_result().unwrap(), estate, eflags)?;
+                Ok(PlanStateNode::Result(::mcx::alloc_in(estate.es_query_cxt, state)?))
             })?
         }
         NodeTag::T_ProjectSet => {
@@ -634,12 +634,13 @@ pub fn exec_init_node<'mcx>(
             stack_depth_core::with_own_frame(|| -> PgResult<PlanStateNode<'mcx>> {
                 Ok({
                     let mcx = estate.es_query_cxt;
-                    PlanStateNode::SeqScan(::nodeseqscan::exec_init_seq_scan(
+                    let state = ::nodeseqscan::exec_init_seq_scan(
                         mcx,
                         node.as_seq_scan().unwrap(),
                         estate,
                         eflags,
-                    )?)
+                    )?;
+                    PlanStateNode::SeqScan(::mcx::alloc_in(mcx, state)?)
                 })
             })?
         }
@@ -757,12 +758,13 @@ pub fn exec_init_node<'mcx>(
             stack_depth_core::with_own_frame(|| -> PgResult<PlanStateNode<'mcx>> {
                 Ok({
                     let mcx = estate.es_query_cxt;
-                    PlanStateNode::IndexScan(::nodeindexscan::exec_init_index_scan(
+                    let state = ::nodeindexscan::exec_init_index_scan(
                         mcx,
                         node.as_index_scan().unwrap(),
                         estate,
                         eflags,
-                    )?)
+                    )?;
+                    PlanStateNode::IndexScan(::mcx::alloc_in(mcx, state)?)
                 })
             })?
         }
@@ -770,12 +772,13 @@ pub fn exec_init_node<'mcx>(
             stack_depth_core::with_own_frame(|| -> PgResult<PlanStateNode<'mcx>> {
                 Ok({
                     let mcx = estate.es_query_cxt;
-                    PlanStateNode::TidScan(::nodetidscan::exec_init_tid_scan(
+                    let state = ::nodetidscan::exec_init_tid_scan(
                         mcx,
                         node.as_tid_scan().unwrap(),
                         estate,
                         eflags,
-                    )?)
+                    )?;
+                    PlanStateNode::TidScan(::mcx::alloc_in(mcx, state)?)
                 })
             })?
         }
@@ -783,12 +786,13 @@ pub fn exec_init_node<'mcx>(
             stack_depth_core::with_own_frame(|| -> PgResult<PlanStateNode<'mcx>> {
                 Ok({
                     let mcx = estate.es_query_cxt;
-                    PlanStateNode::TidRangeScan(::nodetidrangescan::exec_init_tid_range_scan(
+                    let state = ::nodetidrangescan::exec_init_tid_range_scan(
                         mcx,
                         node.as_tid_range_scan().unwrap(),
                         estate,
                         eflags,
-                    )?)
+                    )?;
+                    PlanStateNode::TidRangeScan(::mcx::alloc_in(mcx, state)?)
                 })
             })?
         }
@@ -829,14 +833,13 @@ pub fn exec_init_node<'mcx>(
             stack_depth_core::with_own_frame(|| -> PgResult<PlanStateNode<'mcx>> {
                 Ok({
                     let mcx = estate.es_query_cxt;
-                    PlanStateNode::BitmapIndexScan(
-                        ::nodebitmapindexscan::exec_init_bitmap_index_scan(
-                            mcx,
-                            node.as_bitmap_index_scan().unwrap(),
-                            estate,
-                            eflags,
-                        )?,
-                    )
+                    let state = ::nodebitmapindexscan::exec_init_bitmap_index_scan(
+                        mcx,
+                        node.as_bitmap_index_scan().unwrap(),
+                        estate,
+                        eflags,
+                    )?;
+                    PlanStateNode::BitmapIndexScan(::mcx::alloc_in(mcx, state)?)
                 })
             })?
         }
@@ -949,13 +952,17 @@ pub fn exec_init_node<'mcx>(
                         &outer_desc,
                         result_desc,
                     )?;
-                    PlanStateNode::Sort(SortNode {
-                        state,
-                        outer: ::mcx::alloc_in(estate.es_query_cxt, outer)?,
-                        outer_desc: Some(outer_desc),
-                        lane_fusible: None,
-                        rd_shape_refused: false,
-                    })
+                    let mcx = estate.es_query_cxt;
+                    PlanStateNode::Sort(::mcx::alloc_in(
+                        mcx,
+                        SortNode {
+                            state,
+                            outer: ::mcx::alloc_in(mcx, outer)?,
+                            outer_desc: Some(outer_desc),
+                            lane_fusible: None,
+                            rd_shape_refused: false,
+                        },
+                    )?)
                 })
             })?
         }
@@ -1081,10 +1088,11 @@ pub fn exec_init_node<'mcx>(
                         eflags,
                         outer_desc.as_ref(),
                     )?;
-                    PlanStateNode::Limit(LimitNode {
-                        state,
-                        outer: ::mcx::alloc_in(estate.es_query_cxt, outer)?,
-                    })
+                    let mcx = estate.es_query_cxt;
+                    PlanStateNode::Limit(::mcx::alloc_in(
+                        mcx,
+                        LimitNode { state, outer: ::mcx::alloc_in(mcx, outer)? },
+                    )?)
                 })
             })?
         }
@@ -1214,12 +1222,15 @@ pub fn exec_init_node<'mcx>(
                         desc,
                         &inner_desc,
                     )?;
-                    PlanStateNode::NestLoop(NestLoopNode {
-                        state,
-                        outer: ::mcx::alloc_in(mcx, outer)?,
-                        inner: ::mcx::alloc_in(mcx, inner)?,
-                        lane_fusible: None,
-                    })
+                    PlanStateNode::NestLoop(::mcx::alloc_in(
+                        mcx,
+                        NestLoopNode {
+                            state,
+                            outer: ::mcx::alloc_in(mcx, outer)?,
+                            inner: ::mcx::alloc_in(mcx, inner)?,
+                            lane_fusible: None,
+                        },
+                    )?)
                 })
             })?
         }
@@ -2164,6 +2175,7 @@ fn agg_arm<'mcx>(
     let AggPlanState { agg, outer, .. } = aps;
     match outer {
         PlanStateNode::SeqScan(ss) => {
+            let ss = &mut **ss;
             // P2 gate (flip-ladder §5 arm #1): PGRUST_FUSED_ARM_AGG_SEQ.
             if fused_arm_enabled(FusedArm::AggSeq)
                 && seq_agg_fusible(agg, ss, estate)
@@ -4134,6 +4146,7 @@ impl<'mcx> ::nodehash::HashBuildInput<'mcx> for PlanStateNode<'mcx> {
         estate: &mut EStateData<'mcx>,
     ) -> PgResult<()> {
         if let PlanStateNode::SeqScan(ss) = self {
+            let ss = &mut **ss;
             // P2 gates (flip-ladder §5 arms #6/#7):
             // PGRUST_FUSED_ARM_HASH_BUILD_PROJ (projected build source) /
             // PGRUST_FUSED_ARM_HASH_BUILD (bare build source). The gate is

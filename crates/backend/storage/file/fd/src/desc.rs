@@ -566,7 +566,12 @@ fn open_stdio(name: &str, mode: &str) -> Result<StdFile, i32> {
         "a+" => opts.read(true).append(true).create(true),
         _ => opts.read(true),
     };
-    opts.open(name).map_err(|e| e.raw_os_error().unwrap_or(0))
+    let file = opts.open(name).map_err(|e| e.raw_os_error().unwrap_or(0));
+    // The "w"/"a" modes create outside vfs: bump the file-creation generation.
+    if m.starts_with(['w', 'a']) {
+        crate::note_file_created();
+    }
+    file
 }
 
 fn popen(command: &str, mode: &str) -> Result<PipeHandle, i32> {

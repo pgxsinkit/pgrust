@@ -1453,6 +1453,8 @@ pub fn InitWalRecovery() -> PgResult<InitWalRecoveryResult> {
                     <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&ti.path),
                     &linkloc,
                 );
+                // Created outside vfs: bump the file-creation generation.
+                fd::note_file_created();
                 if let Err(e) = link_result {
                     // xlogrecovery.c:704-707: errcode_for_file_access() + "%m".
                     { ereport(ERROR)

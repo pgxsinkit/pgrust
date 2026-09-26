@@ -7,7 +7,9 @@
 //! `--cfg pgrust_sim` (set exclusively by the sim harness RUSTFLAGS — never in
 //! `.cargo/config`, product profiles, or CI cluster submit envs). Product codegen
 //! is byte-identical to raw libc calls by construction: every op is an
-//! `#[inline]` single-syscall wrapper.
+//! `#[inline]` single-syscall wrapper. The one addition is outside the trait: the
+//! `open` (with `O_CREAT`), `rename` and `mkdir` shims also bump the process-wide
+//! [`file_creation_generation`] after the call.
 //!
 //! Binding rules (contract §1.1):
 //! - **Errno contract (C-shaped):** every op returns `-1`/negative on failure
@@ -33,6 +35,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 use core::ffi::CStr;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
 pub use libc::{c_int, mode_t, off_t};
@@ -368,7 +371,6 @@ macro_rules! shims {
 }
 
 shims! {
-    fn open(path: &CStr, flags: c_int, mode: mode_t) -> c_int;
     fn close(fd: c_int) -> c_int;
     fn preadv(fd: c_int, iov: &[libc::iovec], off: off_t) -> isize;
     fn pwritev(fd: c_int, iov: &[libc::iovec], off: off_t) -> isize;
@@ -387,11 +389,76 @@ shims! {
     fn lstat(path: &CStr, out: &mut FileInfo) -> c_int;
     fn read_link(path: &CStr, buf: &mut [u8]) -> isize;
     fn unlink(path: &CStr) -> c_int;
-    fn rename(from: &CStr, to: &CStr) -> c_int;
-    fn mkdir(path: &CStr, mode: mode_t) -> c_int;
     fn rmdir(path: &CStr) -> c_int;
     fn read_dir(path: &CStr) -> VfsResult<VfsDirIter>;
     fn fd_budget_probe(max_to_probe: usize) -> usize;
+}
+
+// The three ops that can make a path exist, each followed by a generation bump
+// (below). The bump comes AFTER the call, so the path already exists when the
+// generation moves.
+
+/// open(2); a call with `O_CREAT` bumps the file-creation generation, whether or
+/// not it created anything (an existing file costs one spurious invalidation).
+#[inline]
+pub fn open(path: &CStr, flags: c_int, mode: mode_t) -> c_int {
+    let fd = ACTIVE.open(path, flags, mode);
+    if flags & libc::O_CREAT != 0 {
+        note_file_created();
+    }
+    fd
+}
+
+/// rename(2); bumps the file-creation generation (the target path now exists).
+#[inline]
+pub fn rename(from: &CStr, to: &CStr) -> c_int {
+    let rc = ACTIVE.rename(from, to);
+    note_file_created();
+    rc
+}
+
+/// mkdir(2); bumps the file-creation generation.
+#[inline]
+pub fn mkdir(path: &CStr, mode: mode_t) -> c_int {
+    let rc = ACTIVE.mkdir(path, mode);
+    note_file_created();
+    rc
+}
+
+// ---------------------------------------------------------------------------
+// The file-creation generation (pgrust; no C counterpart). A count of the calls
+// that can make a path exist, bumped after each one: the `open` (with O_CREAT),
+// `rename` and `mkdir` shims above, plus the creation paths that do not come
+// through vfs, which call `note_file_created` themselves (fd's fopen plane and
+// macOS clone arm, the janitor's parallel FILE_COPY workers, the tablespace
+// symlinks of CREATE TABLESPACE and of recovery's tablespace_map). A new path
+// that can create a relation file without going through these shims must call
+// it too.
+//
+// md uses it to remember that a fork was absent (`mdexists`): it reads the
+// generation BEFORE probing, and trusts the absence only while the generation
+// is unchanged. A file created after the probe bumps it afterwards, so a
+// cached absence is never served once anything has been created.
+//
+// One counter for the whole process is enough because every backend,
+// natively and on wasm, is a thread of this one process: nothing else creates
+// files in the data directory while the server runs.
+// ---------------------------------------------------------------------------
+
+static FILE_CREATION_GEN: AtomicU64 = AtomicU64::new(1);
+
+/// The current file-creation generation. Read it before a probe whose
+/// "absent" answer is to be reused.
+#[inline]
+pub fn file_creation_generation() -> u64 {
+    FILE_CREATION_GEN.load(Ordering::Acquire)
+}
+
+/// Record that a path may have come into existence. Call it after the file
+/// exists.
+#[inline]
+pub fn note_file_created() {
+    FILE_CREATION_GEN.fetch_add(1, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------

@@ -285,3 +285,24 @@ fn vfsfd_guard_posix_drop_closes_and_into_raw_disarms() {
     assert_eq!(crate::close(raw2), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn creation_ops_bump_the_file_creation_generation() {
+    let dir = tmpdir("gen");
+    let (f, g) = (c(&format!("{dir}/f")), c(&format!("{dir}/g")));
+
+    let g0 = crate::file_creation_generation();
+    let fd = crate::open(&f, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600);
+    assert!(fd >= 0);
+    assert_eq!(crate::close(fd), 0);
+    let g1 = crate::file_creation_generation();
+    assert!(g1 > g0, "open with O_CREAT must bump");
+
+    assert_eq!(crate::rename(&f, &g), 0);
+    let g2 = crate::file_creation_generation();
+    assert!(g2 > g1, "rename must bump");
+
+    assert_eq!(crate::mkdir(&c(&format!("{dir}/d")), 0o700), 0);
+    assert!(crate::file_creation_generation() > g2, "mkdir must bump");
+    let _ = std::fs::remove_dir_all(&dir);
+}

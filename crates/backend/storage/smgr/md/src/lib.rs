@@ -163,7 +163,42 @@ pub fn mdexists(
     if !in_recovery() {
         mdclose(st, forknum)?;
     }
-    Ok(mdopenfork(rlocator, st, forknum, EXTENSION_RETURN_NULL)?.is_some())
+    // pgrust: a fork found absent is remembered until any file is created in
+    // the process (fd::file_creation_generation; vfs has the contract). An
+    // index that has never been vacuumed has no FSM fork, and fsm_readbuf
+    // checks for it again at every btree page split: an ENOENT open each time,
+    // which on wasm is a round trip to the storage host. The generation is
+    // read before the probe, so a fork created after it bumps the generation
+    // and is probed again.
+    let fk = fork_idx(forknum);
+    let gen = fd::file_creation_generation();
+    if known_absent(st, gen, fk) {
+        return Ok(false);
+    }
+    let exists = mdopenfork(rlocator, st, forknum, EXTENSION_RETURN_NULL)?.is_some();
+    if !exists {
+        note_absent(st, gen, fk);
+    }
+    Ok(exists)
+}
+
+// MdRelnState::md_absent_forks is `generation << SMGR_NFORKS | fork bits`: an
+// absence recorded at an older generation is dead, so one generation per
+// handle serves every fork.
+const ABSENT_FORK_BITS: u32 = SMGR_NFORKS as u32;
+
+#[inline]
+fn known_absent(st: &MdRelnState, gen: u64, fk: usize) -> bool {
+    st.md_absent_forks >> ABSENT_FORK_BITS == gen && st.md_absent_forks & (1 << fk) != 0
+}
+
+#[inline]
+fn note_absent(st: &mut MdRelnState, gen: u64, fk: usize) {
+    let mut forks = 0;
+    if st.md_absent_forks >> ABSENT_FORK_BITS == gen {
+        forks = st.md_absent_forks & ((1 << ABSENT_FORK_BITS) - 1);
+    }
+    st.md_absent_forks = gen << ABSENT_FORK_BITS | forks | 1 << fk;
 }
 
 pub fn mdcreate(
@@ -1608,6 +1643,31 @@ mod tests {
         RelFileLocator { spcOid: 1, dbOid: db, relNumber: 16384 }
     }
 
+    // Seams are install-once per process, so md's unit tests install theirs
+    // here and nowhere else. The relpathbackend stub renders every input (the
+    // md_relpath pin below) under a scratch root (the mdexists tests below
+    // create and probe real files there).
+    static SEAMS: std::sync::Once = std::sync::Once::new();
+
+    fn scratch_root() -> &'static str {
+        static ROOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("pgrust_md_test_{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir.to_str().unwrap().to_owned()
+        })
+    }
+
+    fn install_test_seams() {
+        SEAMS.call_once(|| {
+            relpath_seams::relpathbackend::set(|l, b, f| {
+                let (spc, db, rel) = (l.spcOid, l.dbOid, l.relNumber);
+                format!("{}/{spc}|{db}|{rel}|{b}|{}", scratch_root(), f as i32)
+            });
+            tablespace_seams::tablespace_create_dbspace::set(|_, _, _| Ok(()));
+        });
+    }
+
     #[test]
     fn md_relpath_forwards_locator_backend_and_fork_to_relpathbackend() {
         // Regression pin (GL-TESTFIX-1 F-R2-2 adjudication): the old
@@ -1615,11 +1675,8 @@ mod tests {
         // "base/0/NNNN") and stamped numeric fork suffixes. C parity =
         // relpathbackend(rlocator, is_temp ? MyProcNumber : INVALID, fork);
         // the stub renders all three inputs so forwarding is fully pinned.
-        // Seams are install-once per process: this is the ONLY md unit test
-        // that installs relpathbackend, so both arms are covered here.
-        relpath_seams::relpathbackend::set(|l, b, f| {
-            format!("{}|{}|{}|{}|{}", l.spcOid, l.dbOid, l.relNumber, b, f as i32)
-        });
+        install_test_seams();
+        let root = scratch_root();
         let shared = types_storage::aio::PgAioTargetData {
             smgr: types_storage::aio::PgAioTargetSmgr {
                 rlocator: RelFileLocator { spcOid: 1664, dbOid: 0, relNumber: 1260 },
@@ -1630,7 +1687,10 @@ mod tests {
                 ..Default::default()
             },
         };
-        assert_eq!(md_relpath(&shared), format!("1664|0|1260|{INVALID_PROC_NUMBER}|0"));
+        assert_eq!(
+            md_relpath(&shared),
+            format!("{root}/1664|0|1260|{INVALID_PROC_NUMBER}|0")
+        );
 
         let temp = types_storage::aio::PgAioTargetData {
             smgr: types_storage::aio::PgAioTargetSmgr {
@@ -1645,7 +1705,7 @@ mod tests {
         let me = init_small::globals::MyProcNumber();
         assert_eq!(
             md_relpath(&temp),
-            format!("1663|5|16384|{me}|{}", ForkNumber::FSM_FORKNUM as i32)
+            format!("{root}/1663|5|16384|{me}|{}", ForkNumber::FSM_FORKNUM as i32)
         );
     }
 
@@ -1765,6 +1825,76 @@ mod tests {
             assert_eq!(iov[1].len(), 4);
         });
         assert!(n.is_some());
+    }
+
+    // --- mdexists' absent-fork cache -----------------------------------------
+    //
+    // Real files under scratch_root(). The relations are temp relations
+    // (backend != INVALID_PROC_NUMBER), so mdcreate skips the size cache and the
+    // sync-request machinery. These are the only md tests that create files, and
+    // they hold FILES so that no creation of theirs moves the generation under
+    // the other.
+
+    static FILES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn fs_test() -> std::sync::MutexGuard<'static, ()> {
+        let guard = FILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        install_test_seams();
+        fd::InitFileAccess();
+        guard
+    }
+
+    fn temp_rel(rel: u32) -> RelFileLocatorBackend {
+        RelFileLocatorBackend {
+            locator: RelFileLocator { spcOid: 1663, dbOid: 5, relNumber: rel },
+            backend: 3,
+        }
+    }
+
+    #[test]
+    fn mdexists_sees_a_fork_created_after_it_was_found_absent() {
+        let _g = fs_test();
+        let rel = temp_rel(9_100_001);
+        let fsm = ForkNumber::FSM_FORKNUM;
+        // Two handles on one relation, as two backends hold them.
+        let mut reader = MdRelnState::default();
+        let mut creator = MdRelnState::default();
+
+        assert!(!mdexists(rel, &mut reader, fsm).unwrap());
+        assert!(!mdexists(rel, &mut reader, fsm).unwrap());
+        // fsm_extend's path: smgrcreate -> mdcreate, on the other handle.
+        mdcreate(rel, &mut creator, fsm, false).unwrap();
+        assert!(mdexists(rel, &mut reader, fsm).unwrap(), "a fork created since must be found");
+
+        mdclose(&mut reader, fsm).unwrap();
+        mdclose(&mut creator, fsm).unwrap();
+        std::fs::remove_file(relpath(rel, fsm)).unwrap();
+    }
+
+    #[test]
+    fn two_absent_probes_make_one_filesystem_call() {
+        let _g = fs_test();
+        let rel = temp_rel(9_100_002);
+        let fsm = ForkNumber::FSM_FORKNUM;
+        let mut st = MdRelnState::default();
+        let gen = fd::file_creation_generation();
+
+        assert!(!mdexists(rel, &mut st, fsm).unwrap());
+        // Put the fork in place behind md's back: std::fs creates it without
+        // bumping the generation, so only a probe that reaches the filesystem
+        // can see it.
+        std::fs::write(relpath(rel, fsm), b"").unwrap();
+        assert!(
+            !mdexists(rel, &mut st, fsm).unwrap(),
+            "the second probe must be answered without a filesystem call"
+        );
+        assert_eq!(fd::file_creation_generation(), gen, "nothing created a file through vfs");
+        // Any creation anywhere in the process ends the cached answer.
+        fd::note_file_created();
+        assert!(mdexists(rel, &mut st, fsm).unwrap());
+
+        mdclose(&mut st, fsm).unwrap();
+        std::fs::remove_file(relpath(rel, fsm)).unwrap();
     }
 }
 

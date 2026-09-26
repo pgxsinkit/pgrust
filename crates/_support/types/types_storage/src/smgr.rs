@@ -73,6 +73,10 @@ impl Default for MdfdVec {
 pub struct MdRelnState {
     pub md_num_open_segs: [i32; SMGR_NFORKS],
     pub md_seg_fds: [Vec<MdfdVec>; SMGR_NFORKS],
+    // pgrust (no C counterpart): the forks mdexists found absent, as
+    // `file-creation generation << SMGR_NFORKS | one bit per fork`. 0 = none.
+    // One word, because smgr pins SMgrRelation's size.
+    pub md_absent_forks: u64,
 }
 
 #[cfg(test)]

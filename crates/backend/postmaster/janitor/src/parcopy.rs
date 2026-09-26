@@ -319,6 +319,19 @@ fn park_failure(failure: &Mutex<Option<CopyFailure>>, abort: &AtomicBool, f: Cop
 }
 
 fn copy_one_dir(job: &CopyDirJob, abort: &AtomicBool, knobs: CopyKnobs) -> Result<(), CopyFailure> {
+    let result = copy_one_dir_files(job, abort, knobs);
+    // The directory and its files were created outside vfs: bump the
+    // file-creation generation once they all exist (a failed batch's partial
+    // files included), so no cached "fork is absent" answer outlives them.
+    fd::note_file_created();
+    result
+}
+
+fn copy_one_dir_files(
+    job: &CopyDirJob,
+    abort: &AtomicBool,
+    knobs: CopyKnobs,
+) -> Result<(), CopyFailure> {
     let cdst = cstr(&job.dst_dir)?;
     // MakePGDirectory's shape: one mkdir with pg_dir_create_mode; any
     // failure (EEXIST included — the dst must not pre-exist) is fatal to

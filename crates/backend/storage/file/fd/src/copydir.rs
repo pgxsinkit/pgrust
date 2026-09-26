@@ -217,6 +217,8 @@ fn clone_file(fromfile: &str, tofile: &str) -> PgResult<()> {
             libc::COPYFILE_CLONE_FORCE,
         )
     };
+    // copyfile(3) creates `tofile` outside vfs (errno is untouched).
+    crate::note_file_created();
     if rc < 0 {
         return Err(ereport(ERROR)
             .with_saved_errno(get_errno())

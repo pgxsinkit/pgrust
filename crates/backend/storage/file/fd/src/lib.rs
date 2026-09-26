@@ -61,6 +61,9 @@ pub use ::vfs::FileInfo;
 // The shared errno TLS cell (DST P1 errno contract): fenced callers read the
 // raw errno after fd-crate calls through these, not via std::io::Error.
 pub use ::vfs::{get_errno, set_errno};
+// The process-wide file-creation generation (vfs has the contract): md keys its
+// "fork is absent" answers on it, and creation paths outside vfs bump it.
+pub use ::vfs::{file_creation_generation, note_file_created};
 pub use temp::{
     GetNextTempTableSpace, GetTempTablespaces, OpenTemporaryFile, PathNameCreateTemporaryDir,
     PathNameCreateTemporaryFile, PathNameDeleteTemporaryDir, PathNameDeleteTemporaryFile,

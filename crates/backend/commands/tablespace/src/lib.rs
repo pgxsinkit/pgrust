@@ -585,6 +585,9 @@ fn create_tablespace_directories(location: &str, tablespaceoid: Oid) -> PgResult
         };
         #[cfg(not(target_family = "wasm"))]
         let link_result = std::os::unix::fs::symlink(location, &linkloc);
+        // The link makes a directory tree visible outside vfs: bump the
+        // file-creation generation.
+        fd::note_file_created();
         if let Err(e) = link_result {
             return Err(ereport(ERROR)
                 .with_saved_errno(e.raw_os_error().unwrap_or(0))

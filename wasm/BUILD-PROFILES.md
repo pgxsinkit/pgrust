@@ -358,3 +358,157 @@ The threads module is byte-identical to the arm that was measured. Both are unde
 cap, the threads one by 6 426 154 bytes. The pass costs 163 s per target here (it was 221 s and
 230 s with the inlining on), into an already-warm target directory — this flag changes nothing in
 cargo's unit graph, so adopting it is a re-uplift and a Binaryen pass, not a rebuild.
+
+## Profile-guided optimisation: the threads module is built from a profile (2026-09-26)
+
+The native diagnosis behind malisper/pgrust#117 (pglite-v-pgrust `tmp/agents/planner/diagnosis.md`)
+found that pgrust's extra cost per statement is mostly instructions per cycle, not extra
+instructions, and that a profile-guided build (`pgo/pgo-build.sh`, trained on `pgo/train.sql`)
+removes all of it natively: rows 7, 9 and 1 of the Speedtest went from about 2× C to 0.70–0.96× C.
+Its §12.4 said the native profile cannot be reused here: LLVM matches a profile to functions by
+symbol name, and the wasm build's names carry different crate hashes. So the profile has to come
+from the wasm build itself, which is what this section is.
+
+### The two legs
+
+`PGRUST_WASM_PGO=generate` builds an instrumented `wasm32-wasip1-threads` module with the release
+settings exactly (fat LTO, `opt-level 3`, one codegen unit, `browser` features) and no Binaryen pass;
+`PGRUST_WASM_PGO=use:<profdata>` rebuilds with `-Cprofile-use` and runs the usual
+`wasm-opt -Oz --one-caller-inline-max-function-size=0`. Both go through `wasm/pgo-rustc-wrapper.sh`
+as `RUSTC_WRAPPER`, which gives the flag to our crates and their crates.io dependencies only, never
+to the `-Zbuild-std` units. Each leg builds into a target directory of its own
+(`target/pgo-wasm-generate/`, `target/pgo-wasm-use-<profile sha>/`) that remembers the flags it was
+built with.
+
+What had to be solved, in the order it came up:
+
+1. **The profile runtime is not in the target.** `-Cprofile-generate` links LLVM's compiler-rt
+   `lib/profile`, which the stock wasm targets do not ship and which `rust-src` does not carry the
+   source of (it has `src/llvm-project/libunwind` only). `profiler_builtins` is added to
+   `-Zbuild-std` and compiled from compiler-rt source (`PGRUST_WASM_COMPILER_RT`) with a wasi-sdk
+   clang and sysroot (`WASI_SDK_PATH`), as upstream compiler-rt builds it for WASI:
+   `-D_WASI_EMULATED_MMAN -D_WASI_EMULATED_GETPID`, the two emulation archives from the wasi-sdk
+   sysroot at link time, and `-pthread -matomics -mbulk-memory` so wasm-ld takes it into a
+   shared-memory module. compiler-rt 22.1.8's profile runtime already has its wasm/WASI paths
+   (`InstrProfilingPlatformLinux.c`, `__wasi__` in `InstrProfilingUtil.c` and
+   `InstrProfilingPort.h`); nothing in it was changed.
+2. **`core` cannot be instrumented.** With `-Cprofile-generate` in `RUSTFLAGS`, `core` fails with
+   `E0463 can't find crate for profiler_builtins` and six thousand cascading errors: rustc makes every
+   instrumented crate depend on `profiler_builtins` (`inject_profiler_runtime` in rustc_metadata's
+   `creader.rs`, with no exception for `core`) and `profiler_builtins` depends on `core`. The
+   wrapper leaves every build-std unit alone (cargo marks them `-Z force-unstable-if-unmarked`),
+   which is also what the native recipe does — its std is the prebuilt, uninstrumented one. The
+   generic parts of std are monomorphised into our crates and instrumented there.
+3. **Fat LTO dropped the runtime and nothing was ever written.** The first instrumented module ran
+   the training to a clean `exit(0)` and wrote no profile: the runtime's file-writing half was not
+   in it (none of its strings were). LLVM keeps the runtime alive through a hook function in each
+   instrumented crate; after fat LTO nothing roots that hook, so wasm-ld extracts the runtime's
+   objects and then garbage-collects them, constructor — the `atexit` registration — and all. A
+   small crate showed the same with `lto = "fat"` and not without it. `--export=__llvm_profile_runtime`
+   on the instrumented link roots it (`--undefined=` does not), and the leg now checks the module
+   for the runtime's strings.
+4. **The two legs had different symbol names.** The first use build warned "no profile data" for
+   62 956 functions: every crate hash differed from the instrumented build's. Cargo derives a
+   crate's hash from its whole dependency graph, and `-Zbuild-std=…,profiler_builtins` makes the
+   runtime a dependency of every unit. So both legs build with the same `-Zbuild-std` set; the use
+   leg compiles the runtime and never links it (it checks that too), and needs the same wasi-sdk and
+   compiler-rt source to do so.
+5. **Cargo cannot see the wrapper's flags,** so it would call a unit built without them fresh — the
+   directories above, and their flags stamp, are for that.
+
+`-Cprofile-generate`, `panic=unwind` with wasm exception handling, and `-Zbuild-std` otherwise
+coexisted without a complaint.
+
+### The dump, and training
+
+The runtime writes its `.profraw` from the guest's own `exit(0)` through the guest's WASI calls, to
+`$LLVM_PROFILE_FILE`. The postmaster lane does exit cleanly: closing the host-pipes listener is the
+fast-shutdown request, Postgres checkpoints and exits, and `main` turns the `ProcExitThread` unwind
+into `std::process::exit` — libc's `exit`, which runs the handlers. No host code calls into the
+module. The counters are in the one shared memory, so the dump from the postmaster's exit carries
+what every backend thread counted: `exec_simple_query`'s entry block reads 51 566 after 51 556
+training statements on a backend thread.
+
+Training is `pgo/train.sql` — the native recipe's generic small-statement workload, no Speedtest
+text — sent the way psql sends it, every plain statement and every `\gexec` result its own simple
+query, through pglite-v-pgrust's node lane (its `createPgrustPglite`: the postmaster, backends as
+`node:worker_threads` guest threads, the broker store, `relaxed` durability, node 26.10.0). The
+instrumented module ran the 51 556 statements in 24.6 s. Under `--fs broker` every guest path is in
+the store, so the file lands there; the lane puts the store on its `file` port and reads
+`/pgo/train.profraw` back out with the store library after the engine closes. The harness is the
+bench's scratch `tmp/agents/pgo-wasm/train.ts`; the bench note
+(`docs/results/2026-09-26-wasm-pgo.md`) says exactly what it does.
+
+`llvm-profdata merge` (the `llvm-tools` of `nightly-2026-07-17`, LLVM 22.1.8) turns the 15 530 680-byte
+`.profraw` into a 24 434 592-byte indexed profile, sha256 `f9bd4885874a…`, committed zstd-compressed
+as **`pgo/wasm32-wasip1-threads.profdata.zst`** (2 137 693 bytes). It is committed rather than left
+to a recipe because the build is only reproducible from the exact profile, and a second training run
+is not the same profile: the background workers count whatever they happened to do. The use leg
+rebuilt from the committed `.zst` into an emptied directory reproduces the measured module byte for
+byte (`c499994c…`, below).
+
+### Coverage
+
+The profile has records for 65 983 functions, 9 015 of them executed (13.7%). The use build found a
+record for every function it compiled but 21, all in one crate (`spillset`, the executor's spill
+files, which has no record in the profile at all), and reported no control-flow hash mismatch. A
+second profile trained on the Speedtest's 18 scripts (119 244 statements; comparison only, never
+shipped) executes 8 840 functions; `llvm-profdata overlap` puts the two at 56.6% edge overlap.
+
+### Sizes
+
+| Module | raw | gzip -9 -n | sha256 |
+| --- | --- | --- | --- |
+| instrumented (`generate`, no Binaryen) | 103 347 575 | — | `91374a26…` |
+| published before this (`3624f82cf0`) | 39 981 509 | 13 876 753 | `556d0731…` |
+| **PGO, `train.sql` profile** | **39 759 752** | **14 017 177** | `c499994c…` |
+| PGO, Speedtest profile (comparison) | 39 276 350 | 13 829 934 | `55cb6d6e…` |
+
+The PGO module is 221 757 bytes smaller raw and 140 424 bytes larger gzipped. Build cost per leg on
+the i7-1165G7: 12 m 38 s for the instrumented cargo leg, 10 m 46 s for the use leg plus 128 s of
+Binaryen; both are full builds of their own directory.
+
+### What it is worth
+
+pglite-v-pgrust `docs/results/2026-09-26-wasm-pgo.md` has the measurement: the interleaved
+module-only A/B in headless Chromium 149, persistent context, `pgrust-postmaster-opfs-repacked-relaxed`
+against `pglite-opfs-repacked-relaxed`, three rounds per arm. Suite totals 9 683–9 886 ms against
+11 470–11 863 ms for the published module — 16% off the median, rounds not overlapping, every row
+but DROP TABLE faster — and 0.79–0.89× on the node lane's warm rows 1, 9 and 7. The Warm-up line
+(first-use costs, outside every Suite total) is the one thing that gets slower: 766–860 ms against
+616–646 ms. The Speedtest-trained profile lands within 2% of the generic one on the Suite, as the
+native note found.
+
+So the published threads module is built with
+`PGRUST_WASM_PGO=use:pgo/wasm32-wasip1-threads.profdata.zst`. The single-session `postgres.wasm`
+(`wasm32-wasip1`) is **not** profile-guided: it is untrained and unchanged, and the generate leg has
+not been exercised on that target.
+
+### The recipe
+
+compiler-rt source from the LLVM the pinned nightly was built with — rust-lang/llvm-project
+`52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04` for `nightly-2026-07-17` (`rustc 3d50c25bc`, LLVM
+22.1.8; the submodule commit of `src/llvm-project` at that rustc commit) — as a sparse checkout:
+
+```sh
+git init compiler-rt-src && cd compiler-rt-src
+git remote add origin https://github.com/rust-lang/llvm-project.git
+git sparse-checkout set --no-cone /compiler-rt/lib/profile /compiler-rt/include
+git fetch --depth 1 --filter=blob:none origin 52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04
+git checkout FETCH_HEAD            # PGRUST_WASM_COMPILER_RT=$PWD/compiler-rt
+```
+
+wasi-sdk 34 (clang 23.1.0-wasi-sdk, with the `wasm32-wasip1-threads` sysroot) as `WASI_SDK_PATH`,
+and `zstd`. The published threads module:
+
+```sh
+LC_ALL=C PGRUST_WASM_TARGET=wasm32-wasip1-threads PGRUST_WASM_PROFILE=wasm-release \
+  PGRUST_WASM_FEATURES=browser PGRUST_WASM_PGO=use:pgo/wasm32-wasip1-threads.profdata.zst \
+  WASI_SDK_PATH=… PGRUST_WASM_COMPILER_RT=… wasm/wasm-build.sh
+```
+
+A new profile, after the source has moved far enough that the use leg's "no profile data" count
+grows: the same with `PGRUST_WASM_PGO=generate`, `pgo/train.sql` through a postmaster lane with
+`LLVM_PROFILE_FILE` in the guest environment, the `.profraw` read out of the store after a clean
+shutdown, then `llvm-profdata merge` from the nightly's `llvm-tools`
+(`rustup component add llvm-tools --toolchain nightly-2026-07-17`).

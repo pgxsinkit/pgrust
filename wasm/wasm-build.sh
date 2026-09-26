@@ -19,6 +19,15 @@
 # Usage:
 #   wasm/wasm-build.sh              # full gate: crate subset + smoke build
 #   PGRUST_WASM_RUN_SMOKE=1 wasm/wasm-build.sh   # also RUN smoke (needs wasmtime >= 46 w/ exceptions)
+#
+# Profile-guided release modules (off by default; the PGRUST_WASM_PGO block below and
+# wasm/BUILD-PROFILES.md, "Profile-guided optimisation"):
+#   PGRUST_WASM_PROFILE=wasm-release PGRUST_WASM_PGO=generate \
+#     WASI_SDK_PATH=<wasi-sdk> PGRUST_WASM_COMPILER_RT=<compiler-rt source> wasm/wasm-build.sh
+#                                   # instrumented, into target/pgo-wasm-generate/, no Binaryen
+#   PGRUST_WASM_PROFILE=wasm-release PGRUST_WASM_PGO=use:<file.profdata[.zst]> \
+#     WASI_SDK_PATH=<wasi-sdk> PGRUST_WASM_COMPILER_RT=<compiler-rt source> wasm/wasm-build.sh
+#                                   # optimised with that profile, into target/pgo-wasm-use-<sha>/
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -304,13 +313,156 @@ if [ "$PROFILE" = "wasm-release" ]; then
     PROFILE_DESC=" [opt-level ${CARGO_PROFILE_WASM_RELEASE_OPT_LEVEL}, lto ${CARGO_PROFILE_WASM_RELEASE_LTO}, codegen-units ${CARGO_PROFILE_WASM_RELEASE_CODEGEN_UNITS}, ${WASM_OPT_DESC}]"
 fi
 
+# PROFILE-GUIDED OPTIMISATION (PGO), off unless PGRUST_WASM_PGO is set. Two legs, the wasm twin of
+# the native recipe in pgo/pgo-build.sh; wasm/BUILD-PROFILES.md has the measurement and the whole
+# train-and-rebuild loop.
+#
+#   PGRUST_WASM_PGO=generate       an INSTRUMENTED module (-Cprofile-generate): it counts every
+#                                  branch it takes and, when the guest exits, writes a .profraw
+#                                  through its own WASI calls, to $LLVM_PROFILE_FILE if the guest
+#                                  environment has one, else /pgo/default_%m_%p.profraw.
+#   PGRUST_WASM_PGO=use:<profdata> the module rebuilt with that profile (-Cprofile-use), then the
+#                                  same Binaryen pass as every release module. A `.zst` profile
+#                                  (pgo/wasm32-wasip1-threads.profdata.zst, the one the published
+#                                  threads module is built from) is unpacked into target/ first.
+#
+# Both legs need PGRUST_WASM_PROFILE=wasm-release: a profile only matches the codegen settings it
+# was collected under, so the instrumented module is built with exactly the release settings above
+# and is never optimised by Binaryen (it is only ever run, to train).
+#
+# The flags reach OUR crates only -- the workspace and its crates.io dependencies -- through
+# wasm/pgo-rustc-wrapper.sh as RUSTC_WRAPPER, never the -Zbuild-std units: core cannot be
+# instrumented at all (the wrapper's header says why), and the native recipe instruments no std
+# either.
+#
+# A profile finds a function by its symbol name, and a Rust symbol name carries its crate's hash,
+# which cargo derives from the crate's whole dependency graph. So the two legs must hand cargo the
+# SAME graph, and the one thing the instrumented build cannot do without is LLVM's profile runtime:
+# compiler-rt lib/profile, built as the `profiler_builtins` crate, which -Zbuild-std then makes a
+# dependency of every unit. So BOTH legs build with -Zbuild-std=std,panic_unwind,profiler_builtins.
+# The use leg compiles the runtime and never links it (no crate asks for it without
+# -Cprofile-generate; the leg checks), and pays for that only in needing the same two inputs:
+#
+#   WASI_SDK_PATH            a wasi-sdk (clang, llvm-ar, and share/wasi-sysroot with the target's
+#                            libc headers) to compile the runtime's C for the wasm target
+#   PGRUST_WASM_COMPILER_RT  compiler-rt SOURCE from the LLVM the pinned nightly was built with
+#                            (rust-src carries only libunwind); the recipe is in BUILD-PROFILES.md
+#
+# The runtime is built as upstream builds it for WASI (-D_WASI_EMULATED_MMAN
+# -D_WASI_EMULATED_GETPID, linking wasi-libc's two emulation archives from the wasi-sdk sysroot),
+# with -pthread -matomics -mbulk-memory on the threads target so wasm-ld accepts it into a
+# shared-memory module. Cargo never sees the wrapper's flags, so every other input to the crate
+# hashes is the release build's as well.
+#
+# Each leg gets a target directory of its own (the use leg one per profile), because cargo cannot
+# tell a wrapped unit from a plain one: the release directory must never be handed one. The
+# directory remembers the flags it was built with and is emptied when they change.
+# PGRUST_WASM_PGO_LOG names a file that records which units were instrumented and which were not.
+# The use leg warns once per function the profile has no counts for
+# (-pgo-warn-missing-function; PGRUST_WASM_PGO_WARN_MISSING=0 turns that off) -- the build log's
+# own count of what the profile did not reach.
+PGO="${PGRUST_WASM_PGO:-}"
+LINK_TARGET_DIR="$ROOT/target"
+LINK_BUILD_STD="std,panic_unwind"
+LINK_ENV=()
+PGO_DESC=""
+if [ -n "$PGO" ]; then
+    [ "$PROFILE" = "wasm-release" ] || { echo "wasm-build: FAIL — PGRUST_WASM_PGO needs PGRUST_WASM_PROFILE=wasm-release (a profile matches only the settings it was collected under)" >&2; exit 1; }
+    [ "${PGRUST_WASM_SKIP_LINK:-0}" != "1" ] || { echo "wasm-build: FAIL — PGRUST_WASM_PGO with PGRUST_WASM_SKIP_LINK=1 builds nothing" >&2; exit 1; }
+    WASI_SDK="${WASI_SDK_PATH:-}"
+    [ -n "$WASI_SDK" ] && [ -x "$WASI_SDK/bin/clang" ] || { echo "wasm-build: FAIL — PGRUST_WASM_PGO needs WASI_SDK_PATH (a wasi-sdk with bin/clang) to build the profile runtime for $TARGET" >&2; exit 1; }
+    WASI_SYSROOT="$WASI_SDK/share/wasi-sysroot"
+    [ -d "$WASI_SYSROOT/include/$TARGET" ] || { echo "wasm-build: FAIL — $WASI_SYSROOT has no $TARGET headers" >&2; exit 1; }
+    COMPILER_RT="${PGRUST_WASM_COMPILER_RT:-}"
+    [ -n "$COMPILER_RT" ] && [ -d "$COMPILER_RT/lib/profile" ] || { echo "wasm-build: FAIL — PGRUST_WASM_PGO needs PGRUST_WASM_COMPILER_RT, compiler-rt source from $(rustc +"${TOOLCHAIN}" -vV | sed -n 's/^LLVM version: //p') (the recipe is in wasm/BUILD-PROFILES.md)" >&2; exit 1; }
+    RT_CFLAGS="--target=$TARGET --sysroot=$WASI_SYSROOT -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_GETPID"
+    if [ "$TARGET" = "wasm32-wasip1-threads" ]; then
+        RT_CFLAGS="$RT_CFLAGS -pthread -matomics -mbulk-memory"
+    fi
+    T_ENV=${TARGET//-/_}
+    LINK_ENV+=(
+        "RUSTC_WRAPPER=$ROOT/wasm/pgo-rustc-wrapper.sh"
+        "PGRUST_WASM_PGO_TARGET=$TARGET"
+        "RUST_COMPILER_RT_FOR_PROFILER=$COMPILER_RT"
+        "CC_$T_ENV=$WASI_SDK/bin/clang"
+        "CXX_$T_ENV=$WASI_SDK/bin/clang++"
+        "AR_$T_ENV=$WASI_SDK/bin/llvm-ar"
+        "CFLAGS_$T_ENV=$RT_CFLAGS"
+        "CXXFLAGS_$T_ENV=$RT_CFLAGS"
+    )
+    LINK_BUILD_STD="std,panic_unwind,profiler_builtins"
+    case "$PGO" in
+        generate)
+            LINK_ENV+=(
+                "PGRUST_WASM_PGO_UNIT_FLAGS=-Cprofile-generate=/pgo"
+                # --export=__llvm_profile_runtime: without it the profile is never written.
+                # LLVM roots the runtime with a hook function in each instrumented crate that
+                # references __llvm_profile_runtime; after fat LTO nothing keeps that hook
+                # alive, so wasm-ld extracts the runtime's objects and then garbage-collects
+                # them, constructor (the atexit registration) and all. The export makes the
+                # runtime's object a GC root; --undefined does not. The instrumented module
+                # exports one more global than the release module; nothing reads it.
+                "PGRUST_WASM_PGO_BIN_FLAGS=-Clink-arg=--export=__llvm_profile_runtime -Clink-arg=$WASI_SYSROOT/lib/$TARGET/libwasi-emulated-mman.a -Clink-arg=$WASI_SYSROOT/lib/$TARGET/libwasi-emulated-getpid.a"
+            )
+            LINK_TARGET_DIR="$ROOT/target/pgo-wasm-generate"
+            PROFILE_DESC=${PROFILE_DESC/"$WASM_OPT_DESC"/wasm-opt skipped}
+            PGO_DESC=", PGO instrumented (-Cprofile-generate)"
+            ;;
+        use:*)
+            PGO_PROFDATA="${PGO#use:}"
+            [ -f "$PGO_PROFDATA" ] || { echo "wasm-build: FAIL — no profile at $PGO_PROFDATA" >&2; exit 1; }
+            PGO_PROFDATA=$(cd "$(dirname "$PGO_PROFDATA")" && pwd)/$(basename "$PGO_PROFDATA")
+            # A committed profile is zstd-compressed (pgo/*.profdata.zst): rustc reads only the
+            # indexed file, so it is unpacked into target/ first.
+            if [ "${PGO_PROFDATA%.zst}" != "$PGO_PROFDATA" ]; then
+                command -v zstd >/dev/null || { echo "wasm-build: FAIL — $PGO_PROFDATA is zstd-compressed and zstd is not on PATH" >&2; exit 1; }
+                mkdir -p "$ROOT/target/pgo-wasm-profiles"
+                PGO_UNPACKED="$ROOT/target/pgo-wasm-profiles/$(basename "${PGO_PROFDATA%.zst}")"
+                zstd -q -d -f "$PGO_PROFDATA" -o "$PGO_UNPACKED"
+                PGO_PROFDATA=$PGO_UNPACKED
+            fi
+            PGO_SHA=$(sha256sum "$PGO_PROFDATA" | cut -c1-12)
+            UNIT_FLAGS="-Cprofile-use=$PGO_PROFDATA"
+            if [ "${PGRUST_WASM_PGO_WARN_MISSING:-1}" != "0" ]; then
+                UNIT_FLAGS="$UNIT_FLAGS -Cllvm-args=-pgo-warn-missing-function"
+            fi
+            LINK_ENV+=("PGRUST_WASM_PGO_UNIT_FLAGS=$UNIT_FLAGS")
+            LINK_TARGET_DIR="$ROOT/target/pgo-wasm-use-$PGO_SHA"
+            PGO_DESC=", PGO -Cprofile-use=$(basename "$PGO_PROFDATA") (sha256 ${PGO_SHA}…)"
+            ;;
+        *)
+            echo "wasm-build: FAIL — PGRUST_WASM_PGO must be 'generate' or 'use:<profdata>', not '$PGO'" >&2
+            exit 1
+            ;;
+    esac
+    PGO_DESC="$PGO_DESC, runtime: $COMPILER_RT with $("$WASI_SDK/bin/clang" --version | head -1)"
+    [ -n "${PGRUST_WASM_PGO_LOG:-}" ] && LINK_ENV+=("PGRUST_WASM_PGO_LOG=$PGRUST_WASM_PGO_LOG")
+    LINK_ENV+=("CARGO_TARGET_DIR=$LINK_TARGET_DIR")
+    PGO_FLAGS_NOW=$(printf '%s\n' "${LINK_ENV[@]}" | grep -E '^(PGRUST_WASM_PGO_(UNIT|BIN)_FLAGS|RUST_COMPILER_RT_FOR_PROFILER|C(XX)?FLAGS_|CC_|CXX_|AR_)=' ; echo "build-std $LINK_BUILD_STD"; sha256sum "$ROOT/wasm/pgo-rustc-wrapper.sh" | cut -d' ' -f1)
+    PGO_FLAGS_STAMP="$LINK_TARGET_DIR/pgrust-wasm-pgo.flags"
+    if [ -d "$LINK_TARGET_DIR" ] && [ "$(cat "$PGO_FLAGS_STAMP" 2>/dev/null)" != "$PGO_FLAGS_NOW" ]; then
+        echo "wasm-build: PGO flags differ from the ones $LINK_TARGET_DIR was built with; emptying it"
+        rm -rf "$LINK_TARGET_DIR"
+    fi
+    mkdir -p "$LINK_TARGET_DIR"
+    printf '%s\n' "$PGO_FLAGS_NOW" > "$PGO_FLAGS_STAMP"
+fi
+
 if [ "${PGRUST_WASM_SKIP_LINK:-0}" != "1" ]; then
     prove_feature_exclusion
-    cargo +"${TOOLCHAIN}" build --target "$TARGET" -Zbuild-std=std,panic_unwind -p main_main --bin postgres --profile "$PROFILE" \
+    env ${LINK_ENV[@]+"${LINK_ENV[@]}"} cargo +"${TOOLCHAIN}" build --target "$TARGET" -Zbuild-std="$LINK_BUILD_STD" -p main_main --bin postgres --profile "$PROFILE" \
         --no-default-features --features "$FEATURES"
-    BIN_WASM="$ROOT/target/${TARGET}/${PROFILE_DIR}/postgres.wasm"
+    BIN_WASM="$LINK_TARGET_DIR/${TARGET}/${PROFILE_DIR}/postgres.wasm"
     [ -f "$BIN_WASM" ] || { echo "wasm-build: FAIL — postgres.wasm not produced" >&2; exit 1; }
-    echo "wasm-build: postgres.wasm linked ($(du -h "$BIN_WASM" | cut -f1), profile ${PROFILE}${PROFILE_DESC}, features $FEATURES)"
+    echo "wasm-build: postgres.wasm linked ($(du -h "$BIN_WASM" | cut -f1), profile ${PROFILE}${PROFILE_DESC}${PGO_DESC}, features $FEATURES)"
+    # The profile runtime's own strings say whether it is in the module: it must be in the
+    # instrumented one (else nothing is ever written) and must not be in the one built from a profile.
+    case "$PGO" in
+        generate)
+            grep -qa LLVM_PROFILE_FILE "$BIN_WASM" || { echo "wasm-build: FAIL — the instrumented module has no profile runtime linked" >&2; exit 1; } ;;
+        use:*)
+            if grep -qa LLVM_PROFILE_FILE "$BIN_WASM"; then echo "wasm-build: FAIL — the profile runtime was linked into the use leg's module" >&2; exit 1; fi ;;
+    esac
 
     # Binaryen pass — release profile only (dev builds are untouched), opt out
     # with PGRUST_WASM_OPT=0, level from PGRUST_WASM_OPT_LEVEL (default `-Oz`).
@@ -321,7 +473,9 @@ if [ "${PGRUST_WASM_SKIP_LINK:-0}" != "1" ]; then
     # takes ~13% instead — but it is still 5.7 MB, and `-Oz` is both smaller
     # (by 508 KB) and, within the noise, no slower than `-O3` on this link
     # (docs/results/2026-09-18-speed-first-profile.md).
-    if [ "$PROFILE" = "wasm-release" ] && [ "${PGRUST_WASM_OPT:-1}" != "0" ]; then
+    #
+    # Never on the instrumented module (PGRUST_WASM_PGO=generate): it is only ever run, to train.
+    if [ "$PROFILE" = "wasm-release" ] && [ "${PGRUST_WASM_OPT:-1}" != "0" ] && [ "$PGO" != "generate" ]; then
         # The feature list is spelled out ONCE, here, and is deliberately NOT
         # `--all-features`: the release profile strips the module's
         # `target_features` section so wasm-opt cannot detect what the module

@@ -112,16 +112,21 @@ pub fn build_simple_rel<'mcx>(
     assert!(root.simple_rel_array[relid as usize].is_none(), "rel {relid} already exists");
 
     let mcx = root.mcx;
-    let mut rel = RelOptInfo::new(mcx);
+    let relids = relids_singleton(mcx, relid);
+    let consider_startup = root.tuple_fraction > 0.0;
+    let pathtarget_id = Some(empty_pathtarget_id(root));
+    // Filled in place: a stack-built RelOptInfo pushed into the arena was two 1,328-byte moves.
+    let id = root.alloc_rel_new();
+    let rel = root.rel_mut(id);
     rel.reloptkind = RELOPT_BASEREL;
-    rel.relids = relids_singleton(mcx, relid);
-    rel.consider_startup = root.tuple_fraction > 0.0;
+    rel.relids = relids;
+    rel.consider_startup = consider_startup;
     rel.relid = relid;
     rel.rtekind = rtekind as u32;
     rel.rel_parallel_workers = -1;
     rel.nparts = -1;
     rel.baserestrict_min_security = u32::MAX;
-    rel.pathtarget_id = Some(empty_pathtarget_id(root));
+    rel.pathtarget_id = pathtarget_id;
 
     match rtekind {
         RTEKind::RTE_RELATION => {
@@ -146,7 +151,6 @@ pub fn build_simple_rel<'mcx>(
         other => panic!("build_simple_rel (relnode.c): rtekind {other:?}; M2 scan lane"),
     }
 
-    let id = run.root.alloc_rel(rel);
     run.root.simple_rel_array[relid as usize] = Some(id);
 
     if rtekind == RTEKind::RTE_RELATION {

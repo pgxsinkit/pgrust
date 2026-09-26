@@ -1508,6 +1508,9 @@ pub struct RelOptInfo<'mcx> {
 }
 
 impl<'mcx> RelOptInfo<'mcx> {
+    // Always inlined so PlannerInfo::alloc_rel_new can materialise the literal straight into
+    // its arena slot instead of a 1,328-byte stack temporary.
+    #[inline(always)]
     pub fn new(mcx: Mcx<'mcx>) -> Self {
         RelOptInfo {
             reloptkind: RELOPT_BASEREL,
@@ -2020,12 +2023,15 @@ impl<'mcx> PlannerInfo<'mcx> {
             join_search_private: None,
             isAltSubplan: PgVec::new_in(mcx),
             isUsedSubplan: PgVec::new_in(mcx),
-            rel_arena: PgVec::new_in(mcx),
-            path_arena: PgVec::new_in(mcx),
+            // Pre-sized for a small statement (rows 7, 9 and 1 of the Speedtest plan 2-4 rels,
+            // 6-12 paths and 3-18 interned expression nodes): a Vec of 1,328-byte rels starts at
+            // capacity 1 and doubles, so every growth moved the whole arena into a fresh chunk.
+            rel_arena: PgVec::with_capacity_in(4, mcx),
+            path_arena: PgVec::with_capacity_in(16, mcx),
             rinfo_arena: PgVec::new_in(mcx),
             em_arena: PgVec::new_in(mcx),
             ph_info_arena: PgVec::new_in(mcx),
-            node_arena: PgVec::new_in(mcx),
+            node_arena: PgVec::with_capacity_in(16, mcx),
             pathtarget_arena: PgVec::new_in(mcx),
         }
     }
@@ -2186,6 +2192,18 @@ impl<'mcx> PlannerInfo<'mcx> {
     pub fn alloc_rel(&mut self, rel: RelOptInfo<'mcx>) -> RelId {
         let id = RelId(self.rel_arena.len() as u32);
         self.rel_arena.push(rel);
+        id
+    }
+
+    /// A fresh `RelOptInfo::new` pushed into the arena, for the caller to fill in place through
+    /// `rel_mut` (C: makeNode, then field stores). Building the rel on the stack and handing it
+    /// to `alloc_rel` moved all 1,328 bytes twice per rel (the `new` temporary into the local,
+    /// the local into the arena); `new` is always inlined here, so at most the push remains.
+    #[inline]
+    pub fn alloc_rel_new(&mut self) -> RelId {
+        let id = RelId(self.rel_arena.len() as u32);
+        let mcx = self.mcx;
+        self.rel_arena.push(RelOptInfo::new(mcx));
         id
     }
 

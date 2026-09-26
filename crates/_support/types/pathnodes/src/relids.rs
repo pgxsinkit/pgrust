@@ -10,7 +10,7 @@
 //! construction. Pinned by relids_differential_tests.
 
 use mcx::{Mcx, PgVec};
-use crate::{PathTarget, PlannerInfo, PtId, RelId, RelOptInfo, Relids, UpperRelationKind, RELOPT_UPPER_REL};
+use crate::{PathTarget, PlannerInfo, PtId, RelId, Relids, UpperRelationKind, RELOPT_UPPER_REL};
 
 pub use repr::{
     relids_add_member, relids_add_member_mut, relids_copy, relids_del_member, relids_difference,
@@ -537,16 +537,18 @@ pub fn fetch_upper_rel_with_relids<'mcx>(
         }
     }
 
-    let mcx = root.mcx;
-    let mut upperrel = RelOptInfo::new(mcx);
+    let consider_startup = root.tuple_fraction > 0.0;
+    let pathtarget_id = Some(empty_pathtarget_id(root));
+    // Filled in place: a stack-built RelOptInfo pushed into the arena was two 1,328-byte moves.
+    let id = root.alloc_rel_new();
+    let upperrel = root.rel_mut(id);
     upperrel.reloptkind = RELOPT_UPPER_REL;
     upperrel.relids = relids;
-    upperrel.consider_startup = root.tuple_fraction > 0.0;
+    upperrel.consider_startup = consider_startup;
     upperrel.nparts = -1;
     upperrel.rel_parallel_workers = -1;
     upperrel.baserestrict_min_security = u32::MAX;
-    upperrel.pathtarget_id = Some(empty_pathtarget_id(root));
-    let id = root.alloc_rel(upperrel);
+    upperrel.pathtarget_id = pathtarget_id;
     root.upper_rels[kind as usize].push(id);
     id
 }

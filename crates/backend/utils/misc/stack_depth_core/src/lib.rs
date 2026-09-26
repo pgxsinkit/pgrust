@@ -137,7 +137,14 @@ pub fn restore_stack_base(base: pg_stack_base_t) {
     STACK_BASE_PTR.set(base);
 }
 
-#[inline(never)]
+// Inlined natively, as C's check_stack_depth is under LTO: pgrust checks in the same recursive
+// functions C does (the expression walkers and mutators, transformExprRecurse, equal,
+// ExecInitExprRec, ExecInitNode/ExecEndNode, create_plan_recurse), 143 times per statement on the
+// Speedtest's row 7, and each out-of-line check cost a call, two TLS loads and a return. On wasm
+// it stays out of line: machine_stack_addr's fallback there takes a local's address, which would
+// force a shadow-stack frame into every caller.
+#[cfg_attr(not(target_family = "wasm"), inline)]
+#[cfg_attr(target_family = "wasm", inline(never))]
 pub fn stack_is_too_deep() -> bool {
     let stack_base_ptr = STACK_BASE_PTR.get();
     let stack_depth = stack_base_ptr.abs_diff(machine_stack_addr()) as isize;

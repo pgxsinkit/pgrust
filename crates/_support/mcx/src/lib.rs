@@ -2049,10 +2049,28 @@ impl Mcx<'_> {
     /// admission. Private: huge callers go through
     /// [`Mcx::alloc_uninit_bytes_huge`], which admits against
     /// `MAX_ALLOC_HUGE_SIZE` instead.
+    ///
+    /// Only the bump arms are inlined into the call site; the other backends take one
+    /// out-of-line call. With all seven arms always-inlined, every allocation site carried the
+    /// whole dispatch (a jump table and four allocator bodies): callgrind put 670 of pgrust's
+    /// per-statement hot instructions on this `match` line alone on the Speedtest's row 7,
+    /// where bump contexts serve 88% of the allocator's instructions (aset 12%).
     #[inline(always)]
     fn allocate_unchecked(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         self.0.check_live();
         self.0.is_reset.set(false);
+        match &self.0.backend {
+            Backend::Bump(a) | Backend::BumpDrop(a, _) | Backend::BumpForget(a) => {
+                // SAFETY: single-statement borrow, never re-entered (bump_mut).
+                unsafe { bump_mut(a) }.alloc(layout, &self.0.acct)
+            }
+            _ => self.allocate_unchecked_other(layout),
+        }
+    }
+
+    /// `allocate_unchecked`'s non-bump backends, out of line (see there).
+    #[inline(never)]
+    fn allocate_unchecked_other(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         match &self.0.backend {
             Backend::Aset(set) => {
                 self.0.charge(layout.size())?;

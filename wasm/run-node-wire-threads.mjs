@@ -76,10 +76,20 @@
 // differs between two JavaScript engines gets attributed to the engine rather
 // than to a browser.
 //
+// BROKER GATHER (--broker-gather). With --fs broker, every agent's adapter
+// makes one broker write per `fd_pwrite` instead of one per iovec, and the
+// guest channels are minted at broker-fs.js's GATHER_PAYLOAD_BYTES (256 KiB of
+// data per request) instead of the library's 64 KiB.
+//
+// COUNTERS (--io-stats). Every agent counts its guest file calls and the
+// coordinator its broker requests (wasm/io-stats.js); one summary line of the
+// whole run is printed before the verdict.
+//
 // Usage: node run-node-wire-threads.mjs [--stderr FILE] [--pool N] [--workers N]
 //        [--dispatch stdio-wire|stdio-wire-threaded|postmaster] [--fs copy|broker]
 //        [--sql FILE] [--mount PREFIX=memory] [--trace N]
 //        [--fanout N [--fanout-statements M] [--fanout-rows R]]
+//        [--broker-gather] [--io-stats]
 // Env: PGRUST_WASM_THREADS (path to the threads postgres.wasm),
 //      PGRUST_VFS (prefix for vfs.img/vfs.json),
 //      PGRUST_REPACKED_BUNDLE (URL of the @pgxsinkit/pglite-opfs-repacked browser
@@ -109,7 +119,8 @@ import {
 } from './threads-host.js';
 import { runHostPipesScenario } from './hostpipes-scenario.js';
 import { runFanOutScenario, DEFAULT_STATEMENTS, DEFAULT_ROWS } from './fanout-scenario.js';
-import { loadRepackedBundle, repackedBundleUrl } from './broker-fs.js';
+import { loadRepackedBundle, repackedBundleUrl, GATHER_PAYLOAD_BYTES } from './broker-fs.js';
+import { IoStats, describeIoStats } from './io-stats.js';
 import {
   WireReader,
   encodeStartup,
@@ -232,6 +243,34 @@ const MOUNTS = process.argv.flatMap((arg, index) => {
   return [{ prefix, port }];
 });
 if (MOUNTS.length > 0 && FS_MODE !== 'broker') throw new Error('--mount requires --fs broker');
+const BROKER_GATHER = process.argv.includes('--broker-gather');
+if (BROKER_GATHER && FS_MODE !== 'broker') throw new Error('--broker-gather requires --fs broker');
+// One agent for the process instance plus one per pool slot, as makeSpawner numbers them.
+const IO_STATS = process.argv.includes('--io-stats') ? IoStats.create({ agents: POOL_SIZE + 1 }) : null;
+
+/** The whole run's counters in one line: what the guest asked of its files, and the broker's share. */
+function ioStatsLine() {
+  if (!IO_STATS) return null;
+  const s = describeIoStats(new Float64Array(IO_STATS.view.length), IO_STATS.snapshot());
+  const calls = Object.entries(s.guest.all)
+    .filter(([, v]) => v.calls > 0)
+    .map(([k, v]) => `${k} ${v.calls}`)
+    .join(', ');
+  const all = Object.values(s.guest.all);
+  const ms = all.reduce((sum, v) => sum + v.ms, 0);
+  const read = s.guest.all.read.bytes;
+  const written = s.guest.all.write.bytes;
+  const requests = Object.entries(s.broker.requests)
+    .filter(([, n]) => n > 0)
+    .map(([k, n]) => `${k} ${n}`)
+    .join(', ');
+  return (
+    `io-stats: guest file calls [${calls}], ${(read / 1048576).toFixed(1)} MiB read, ` +
+    `${(written / 1048576).toFixed(1)} MiB written, ${ms.toFixed(0)} ms inside them; session agents ` +
+    `[${s.guest.sessionAgents.join(', ')}]; broker requests [${requests || 'none'}] served in ` +
+    `${s.broker.servingMs.toFixed(0)} ms`
+  );
+}
 
 const errFd = stderrFile ? fs.openSync(stderrFile, 'w') : 2;
 
@@ -299,8 +338,9 @@ if (FS_MODE === 'broker') {
   // One channel per pool slot PLUS one for the process instance: the protocol is one request
   // in flight per channel, so two agents may never share one.
   channels = Array.from({ length: POOL_SIZE + 1 }, (_unused, i) =>
-    bundle.RepackedChannel.create({ id: i + 1, doorbell }),
+    bundle.RepackedChannel.create({ id: i + 1, doorbell, ...(BROKER_GATHER ? { payloadBytes: GATHER_PAYLOAD_BYTES } : {}) }),
   );
+  if (BROKER_GATHER) note(`storage: gather on — one broker write per fd_pwrite, ${GATHER_PAYLOAD_BYTES}-byte channel payloads`);
   storageWorker = makeWorker(storageWorkerUrl(import.meta.url), { name: 'pgrust-storage' });
   let storageReady = null;
   let storageFailure = null;
@@ -366,6 +406,7 @@ if (FS_MODE === 'broker') {
       channels: channels.map((c) => c.transfer()),
       doorbell: doorbell.buffer,
       options: { mounts: MOUNTS },
+      ...(IO_STATS ? { ioStats: IO_STATS.buffer } : {}),
     },
     [imageBuf],
   );
@@ -550,6 +591,8 @@ worker.postMessage(
     bundleUrl: BUNDLE_URL,
     channel: channels.length ? channels[0].transfer() : null,
     poolChannels: channels.slice(1).map((c) => c.transfer()),
+    ...(BROKER_GATHER ? { brokerGather: true } : {}),
+    ...(IO_STATS ? { ioStats: IO_STATS.buffer } : {}),
     stdin: stdinPipe.descriptor(),
     stdout: stdoutPipe.descriptor(),
     pipes: pipeDescriptors,
@@ -1117,6 +1160,7 @@ if (POSTMASTER) {
     try { storageWorker.terminate(); } catch { /* already gone */ }
   }
   try { worker.terminate(); } catch { /* already gone */ }
+  if (IO_STATS) note(ioStatsLine());
   if (failures.length) {
     for (const f of failures) note(`DRIVER-FAIL: ${f}`);
     note(`VERDICT: postmaster-node FAIL fs=${FS_MODE}`);
@@ -1196,6 +1240,7 @@ if (storageWorker) {
   try { storageWorker.terminate(); } catch { /* already gone */ }
 }
 
+if (IO_STATS) note(ioStatsLine());
 if (failures.length) {
   for (const f of failures) note(`DRIVER-FAIL: ${f}`);
   note(`VERDICT: threads-node FAIL fs=${FS_MODE}`);

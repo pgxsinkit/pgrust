@@ -85,11 +85,22 @@
 // coordinator its broker requests (wasm/io-stats.js); one summary line of the
 // whole run is printed before the verdict.
 //
+// BROKER SPIN (--broker-spin US). With --fs broker, every guest polls its
+// channel for up to US µs for each reply before it parks, and the coordinator
+// polls the doorbell for up to US µs before it parks (wasm/broker-spin.js). The
+// lane fails unless the coordinator and the process instance both say so.
+//
+// STORE LEVERS (--store-levers grow,coalesce). With --fs broker, the
+// coordinator's root store runs behind wasm/store-levers.js: the arena grows in
+// 4 MiB chunks (trimmed on close) and contiguous arena writes inside one store
+// call become one handle write. The lane prints what they did at stop and fails
+// if the coordinator did not take them or its report does not add up.
+//
 // Usage: node run-node-wire-threads.mjs [--stderr FILE] [--pool N] [--workers N]
 //        [--dispatch stdio-wire|stdio-wire-threaded|postmaster] [--fs copy|broker]
 //        [--sql FILE] [--mount PREFIX=memory] [--trace N]
 //        [--fanout N [--fanout-statements M] [--fanout-rows R]]
-//        [--broker-gather] [--io-stats]
+//        [--broker-gather] [--broker-spin US] [--store-levers grow,coalesce] [--io-stats]
 // Env: PGRUST_WASM_THREADS (path to the threads postgres.wasm),
 //      PGRUST_VFS (prefix for vfs.img/vfs.json),
 //      PGRUST_REPACKED_BUNDLE (URL of the @pgxsinkit/pglite-opfs-repacked browser
@@ -120,6 +131,8 @@ import {
 import { runHostPipesScenario } from './hostpipes-scenario.js';
 import { runFanOutScenario, DEFAULT_STATEMENTS, DEFAULT_ROWS } from './fanout-scenario.js';
 import { loadRepackedBundle, repackedBundleUrl, GATHER_PAYLOAD_BYTES } from './broker-fs.js';
+import { normalizeSpinUs } from './broker-spin.js';
+import { normalizeStoreLevers, storeLeverList } from './store-levers.js';
 import { IoStats, describeIoStats } from './io-stats.js';
 import {
   WireReader,
@@ -245,6 +258,12 @@ const MOUNTS = process.argv.flatMap((arg, index) => {
 if (MOUNTS.length > 0 && FS_MODE !== 'broker') throw new Error('--mount requires --fs broker');
 const BROKER_GATHER = process.argv.includes('--broker-gather');
 if (BROKER_GATHER && FS_MODE !== 'broker') throw new Error('--broker-gather requires --fs broker');
+const spinArg = argAfter('--broker-spin');
+const BROKER_SPIN_US = normalizeSpinUs(spinArg === undefined ? 0 : Number(spinArg));
+if (BROKER_SPIN_US > 0 && FS_MODE !== 'broker') throw new Error('--broker-spin requires --fs broker');
+const STORE_LEVERS = storeLeverList(normalizeStoreLevers(argAfter('--store-levers')));
+if (STORE_LEVERS.length > 0 && FS_MODE !== 'broker') throw new Error('--store-levers requires --fs broker');
+let storeLeverReport = null;
 // One agent for the process instance plus one per pool slot, as makeSpawner numbers them.
 const IO_STATS = process.argv.includes('--io-stats') ? IoStats.create({ agents: POOL_SIZE + 1 }) : null;
 
@@ -272,9 +291,41 @@ function ioStatsLine() {
   );
 }
 
+/**
+ * What --broker-spin and --store-levers must have left behind, checked at the verdict: the process
+ * instance said it spins, and the coordinator's lever report arrived and adds up — the handle saw no
+ * more writes than the store issued (coalesce only ever merges), and no more truncates than the store
+ * issued plus the one trim at close (grow only ever skips or merges).
+ */
+function switchFailures() {
+  const out = [];
+  if (BROKER_SPIN_US > 0 && !hostLog.some((line) => line.includes(`broker reply spin ${BROKER_SPIN_US} µs`))) {
+    out.push(`the process instance never said it spins ${BROKER_SPIN_US} µs for a reply`);
+  }
+  if (STORE_LEVERS.length > 0) {
+    const r = storeLeverReport;
+    if (!r) out.push('store levers were asked for but the coordinator reported none at stop');
+    else {
+      if (r.failed) out.push('a coalesced arena write failed');
+      if (r.handleWrites > r.storeWrites) out.push(`levers made ${r.handleWrites} handle writes of ${r.storeWrites} store writes`);
+      if (r.handleTruncates > r.storeTruncates + 1) {
+        out.push(`levers made ${r.handleTruncates} handle truncates of ${r.storeTruncates} store truncates`);
+      }
+      if (STORE_LEVERS.includes('grow') && r.storeTruncates > 2 && r.handleTruncates >= r.storeTruncates) {
+        out.push(`grow saved no truncates (${r.storeTruncates} -> ${r.handleTruncates})`);
+      }
+      if (STORE_LEVERS.includes('coalesce') && r.storeWrites > 0 && r.handleWrites === 0) {
+        out.push('coalesce wrote nothing through');
+      }
+    }
+  }
+  return out;
+}
+
 const errFd = stderrFile ? fs.openSync(stderrFile, 'w') : 2;
 
 const failures = [];
+const hostLog = [];
 const note = (line) => process.stdout.write(line + '\n');
 
 // The same GUC argv as the single-threaded wire lane, with the threaded
@@ -341,6 +392,8 @@ if (FS_MODE === 'broker') {
     bundle.RepackedChannel.create({ id: i + 1, doorbell, ...(BROKER_GATHER ? { payloadBytes: GATHER_PAYLOAD_BYTES } : {}) }),
   );
   if (BROKER_GATHER) note(`storage: gather on — one broker write per fd_pwrite, ${GATHER_PAYLOAD_BYTES}-byte channel payloads`);
+  if (BROKER_SPIN_US > 0) note(`storage: broker spin ${BROKER_SPIN_US} µs on both sides before parking`);
+  if (STORE_LEVERS.length > 0) note(`storage: store levers ${STORE_LEVERS.join(', ')}`);
   storageWorker = makeWorker(storageWorkerUrl(import.meta.url), { name: 'pgrust-storage' });
   let storageReady = null;
   let storageFailure = null;
@@ -360,6 +413,13 @@ if (FS_MODE === 'broker') {
               m.mounts.map((x) => `${x.prefix}=${x.port}${x.durable ? '' : ' (volatile)'}`).join(', '),
           );
         }
+        // The coordinator's own word for what it runs with, against what was asked.
+        if ((m.brokerSpinUs ?? 0) !== BROKER_SPIN_US) {
+          failures.push(`coordinator runs broker spin ${m.brokerSpinUs ?? 0} µs, asked for ${BROKER_SPIN_US}`);
+        }
+        if ((m.storeLevers || []).join(',') !== STORE_LEVERS.join(',')) {
+          failures.push(`coordinator runs store levers [${(m.storeLevers || []).join(', ')}], asked for [${STORE_LEVERS.join(', ')}]`);
+        }
         storageReady();
         break;
       case 'storage-log':
@@ -378,6 +438,15 @@ if (FS_MODE === 'broker') {
           note(
             `storage: port ${p.name} (${p.port}${p.durable ? '' : ', volatile'}) holds ` +
               `${p.files} files (${p.bytes} bytes) under ${p.root}`,
+          );
+        }
+        storeLeverReport = m.storeLevers || null;
+        if (storeLeverReport) {
+          const r = storeLeverReport;
+          note(
+            `storage: store levers [${r.levers.join(', ')}] — arena writes ${r.storeWrites} -> ${r.handleWrites} ` +
+              `handle writes, arena truncates ${r.storeTruncates} -> ${r.handleTruncates} handle truncates, ` +
+              `${r.trimmedBytes} bytes of slack trimmed at close${r.failed ? ', FAILED' : ''}`,
           );
         }
         storageStoppedResolve();
@@ -405,7 +474,8 @@ if (FS_MODE === 'broker') {
       manifest,
       channels: channels.map((c) => c.transfer()),
       doorbell: doorbell.buffer,
-      options: { mounts: MOUNTS },
+      options: { mounts: MOUNTS, ...(STORE_LEVERS.length > 0 ? { storeLevers: STORE_LEVERS } : {}) },
+      ...(BROKER_SPIN_US > 0 ? { brokerSpinUs: BROKER_SPIN_US } : {}),
       ...(IO_STATS ? { ioStats: IO_STATS.buffer } : {}),
     },
     [imageBuf],
@@ -568,6 +638,7 @@ function handleMessage(m) {
       exited();
       break;
     case 'log':
+      hostLog.push(m.text);
       note(`host: ${m.text}`);
       break;
     default:
@@ -592,6 +663,7 @@ worker.postMessage(
     channel: channels.length ? channels[0].transfer() : null,
     poolChannels: channels.slice(1).map((c) => c.transfer()),
     ...(BROKER_GATHER ? { brokerGather: true } : {}),
+    ...(BROKER_SPIN_US > 0 ? { brokerSpinUs: BROKER_SPIN_US } : {}),
     ...(IO_STATS ? { ioStats: IO_STATS.buffer } : {}),
     stdin: stdinPipe.descriptor(),
     stdout: stdoutPipe.descriptor(),
@@ -1161,6 +1233,7 @@ if (POSTMASTER) {
   }
   try { worker.terminate(); } catch { /* already gone */ }
   if (IO_STATS) note(ioStatsLine());
+  failures.push(...switchFailures());
   if (failures.length) {
     for (const f of failures) note(`DRIVER-FAIL: ${f}`);
     note(`VERDICT: postmaster-node FAIL fs=${FS_MODE}`);
@@ -1241,6 +1314,7 @@ if (storageWorker) {
 }
 
 if (IO_STATS) note(ioStatsLine());
+failures.push(...switchFailures());
 if (failures.length) {
   for (const f of failures) note(`DRIVER-FAIL: ${f}`);
   note(`VERDICT: threads-node FAIL fs=${FS_MODE}`);

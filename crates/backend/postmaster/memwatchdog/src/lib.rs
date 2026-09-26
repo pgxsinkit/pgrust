@@ -379,7 +379,19 @@ fn tick(state: &mut WatchState) {
 /// so the watchdog's lines read as the postmaster's — C has no such thread,
 /// and the closest C analogue of "the process noticed its memory" is the
 /// postmaster speaking.
+///
+/// Not on WASI, where the watchdog has nothing to measure: there is no
+/// /proc/self/status, no cgroup, no physical-memory size (`physical_memory` is
+/// unix-only) and no allocator-stats hook (the wasm build keeps std's
+/// allocator), so its usage is always 0 and it can never fire. All each tick
+/// would do is fail to open /proc/self/status and /proc/self/cgroup, which in
+/// a browser are two round trips to the storage host per second, and the
+/// thread would hold one of the host's prewarmed workers. On WASI
+/// `pgrust.memory_watchdog` therefore has no effect.
 pub fn start(thread_init: impl FnOnce() + Send + 'static) {
+    if cfg!(target_os = "wasi") {
+        return;
+    }
     // elog's per-thread config (C's globals, inherited at fork) is
     // thread-local here and the watchdog thread binds no GUC store: carry
     // the postmaster's log_line_prefix and log_timezone over at spawn so
